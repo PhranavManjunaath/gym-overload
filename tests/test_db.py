@@ -198,3 +198,13 @@ def test_no_history_means_engine_asks_for_starting_weight(session: Session) -> N
     db.add_exercise(session, "bench press")
     with pytest.raises(ValueError, match="starting weight"):
         pe.next_target(db.get_config(session, "bench press"), db.get_history(session, "bench press"))
+
+
+def test_count_sessions_on(session: Session) -> None:
+    db.add_exercise(session, "bench press")
+    db.add_exercise(session, "squat")
+    assert db.count_sessions_on(session, D1) == 0
+    db.log_session(session, "bench press", D1, _sets(60, [10]))
+    db.log_session(session, "squat", D1, _sets(100, [5]))
+    db.log_session(session, "squat", D2, _sets(100, [5]))
+    assert (db.count_sessions_on(session, D1), db.count_sessions_on(session, D2)) == (2, 1)

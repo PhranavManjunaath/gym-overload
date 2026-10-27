@@ -43,7 +43,11 @@ plus workout/diet reminders for consistency. Portfolio project.
 ## CODE STYLE
 
 - Small modules: `db.py`, `parser.py`, `tools.py`, `agent.py`, `bot.py`,
-  `scheduler.py`, `dashboard.py`. Type hints everywhere. Tests in `tests/`.
+  `scheduler.py`, `dashboard.py`, plus `formatting.py` (deterministic text for
+  tool results). Type hints everywhere. Tests in `tests/`.
+- The agent's `verify` node rejects any reply containing a number not found in a
+  tool result or user message; keep it. Agent tests use a scripted fake LLM —
+  never call Groq from pytest.
 - Run `pytest` after every change and show the result.
 - At the end of each task, explain what was built in simple words so the user
   can explain it in interviews.

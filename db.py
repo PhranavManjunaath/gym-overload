@@ -29,6 +29,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    func,
     make_url,
     select,
 )
@@ -148,12 +149,15 @@ def _sqlite_foreign_keys_on(dbapi_conn, _record) -> None:  # type: ignore[no-unt
         cur.close()
 
 
+def database_url() -> str:
+    """DATABASE_URL from the environment, else .env, else the local SQLite file."""
+    load_dotenv(PROJECT_DIR / ".env")          # never overrides a variable that's already set
+    return resolve_database_url(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL))
+
+
 def get_engine(url: Optional[str] = None) -> Engine:
     """Connect to the database (DATABASE_URL from .env by default) and create tables if missing."""
-    if url is None:
-        load_dotenv(PROJECT_DIR / ".env")
-        url = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
-    url = resolve_database_url(url)
+    url = database_url() if url is None else resolve_database_url(url)
     u = make_url(url)
     if u.get_backend_name() == "sqlite":
         if u.database and u.database != ":memory:":
@@ -296,6 +300,10 @@ def get_history(db: Session, exercise_name: str) -> List[pe.Session]:
         for r in rows
     ]
 
+
+def count_sessions_on(db: Session, date: dt.date) -> int:
+    """How many exercise sessions were logged on a date (any exercise) - for reminders."""
+    return db.scalar(select(func.count(WorkoutSession.id)).where(WorkoutSession.date == date)) or 0
 
 # ---------- connection check (run: python db.py) ----------
 
