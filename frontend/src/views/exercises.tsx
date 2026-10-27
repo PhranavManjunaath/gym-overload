@@ -108,7 +108,7 @@ export function ExercisesView() {
   return (
     <>
       <PageHeader title="Exercises" description="Your lifts and their progression settings." />
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
         <div className="flex flex-col gap-4">
           {added && <Alert tone="success">Added {added}.</Alert>}
           <div className="relative">

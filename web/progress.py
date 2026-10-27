@@ -5,10 +5,20 @@ import pandas as pd
 import streamlit as st
 
 import formatting
+import reports
 import tools
 from web import common
 
 st.title("📈 Progress")
+
+with common.session_factory()() as s:
+    streak = tools.streak(s)
+c = streak["consistency"]
+s1, s2, s3 = st.columns(3)
+s1.metric("🔥 Training streak", f"{streak['current_streak']} days")
+s2.metric("Best streak", f"{streak['best_streak']} days")
+s3.metric(f"Consistency (last {c['weeks']} weeks)", "–" if c["percent"] is None else f"{c['percent']}%",
+          help=f"{c['done']} of {c['planned']} planned training days")
 
 exercises = common.exercises()
 if not exercises:
@@ -71,3 +81,10 @@ st.subheader("History")
 table = pd.DataFrame(sessions)[["date", "working_weight_kg", "total_reps", "volume_kg", "best_e1rm_kg", "deload"]]
 table.columns = ["Date", "Weight (kg)", "Total reps", "Volume (kg)", "e1RM (kg)", "Deload"]
 st.dataframe(table.iloc[::-1], hide_index=True, use_container_width=True)
+
+st.subheader("Export")
+with common.session_factory()() as s:
+    workouts_csv, meals_csv = reports.export_workouts_csv(s), reports.export_meals_csv(s)
+e1, e2 = st.columns(2)
+e1.download_button("⬇️ Workouts CSV", workouts_csv, "gym-overload-workouts.csv", "text/csv")
+e2.download_button("⬇️ Meals CSV", meals_csv, "gym-overload-meals.csv", "text/csv")

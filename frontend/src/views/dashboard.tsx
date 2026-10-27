@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { ArrowRight, Dumbbell, PenLine, Target } from "lucide-react";
-import { api, type RecommendationOk, type RecentSession } from "@/lib/api";
+import { api, type ProteinDay, type RecommendationOk, type RecentSession, type Streak } from "@/lib/api";
 import { day, kg, num, titleCase } from "@/lib/format";
 import { useApi } from "@/lib/use-api";
 import { ButtonLink } from "@/components/ui/button";
@@ -35,6 +35,80 @@ function RecentList({ sessions }: { sessions: RecentSession[] }) {
         </Link>
       ))}
     </Card>
+  );
+}
+
+function Stat({ label, value, sub, href }: { label: string; value: string; sub?: string; href: string }) {
+  return (
+    <Link href={href} className="rounded-card border border-border bg-surface p-4 transition-colors duration-150 hover:border-border-strong sm:p-5">
+      <p className="text-[13px] text-muted">{label}</p>
+      <p className="mt-1.5 text-2xl font-semibold tracking-tight num">{value}</p>
+      {sub && <p className="mt-1 text-xs text-subtle num">{sub}</p>}
+    </Link>
+  );
+}
+
+function StatsRow({ streak, protein }: { streak: Streak; protein: ProteinDay }) {
+  const c = streak.consistency;
+  return (
+    <div className="mb-10 grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <Stat
+        href="/settings"
+        label="Training streak"
+        value={`${streak.current_streak} ${streak.current_streak === 1 ? "day" : "days"}`}
+        sub={`Best ${streak.best_streak} · ${streak.logged_today ? "trained today" : "training days only"}`}
+      />
+      <Stat
+        href="/settings"
+        label={`Consistency · last ${c.weeks} weeks`}
+        value={c.percent === null ? "–" : `${c.percent}%`}
+        sub={`${c.done} of ${c.planned} planned days`}
+      />
+      <Stat
+        href="/nutrition"
+        label="Protein today"
+        value={`${num(protein.total_protein_g)} g`}
+        sub={protein.target_g ? `of your ${num(protein.target_g)} g target` : "Set a target in Nutrition"}
+      />
+    </div>
+  );
+}
+
+function ThisWeek() {
+  const { data } = useApi(() => api.report());
+  if (!data) return null;
+  return (
+    <Section title={`This week · ${data.week.replace(" to ", " – ")}`}>
+      <Card className="p-5 sm:p-6">
+        <div className="flex flex-wrap gap-x-8 gap-y-3 text-sm num">
+          <p><span className="text-muted">Training days </span>{data.training_days_done}/{data.training_days_planned}</p>
+          <p><span className="text-muted">Sessions </span>{data.sessions_logged}</p>
+          <p><span className="text-muted">Volume </span>{kg(data.total_volume_kg)}</p>
+          {data.protein && (
+            <p><span className="text-muted">Protein on target </span>{data.protein.on_target}/{data.protein.days} days</p>
+          )}
+        </div>
+        {data.lifts.length > 0 && (
+          <ul className="mt-4 divide-y divide-border border-t border-border">
+            {data.lifts.map((l) => (
+              <li key={l.exercise} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm num">
+                <span className="font-medium">{titleCase(l.exercise)}</span>
+                <span className="flex flex-wrap items-center gap-2">
+                  <span className="text-muted">best e1RM</span> {kg(l.best_e1rm_kg)}
+                  {l.change_kg !== null && (
+                    <span className={l.change_kg >= 0 ? "text-success" : "text-warning"}>
+                      {l.change_kg >= 0 ? "+" : ""}{num(l.change_kg)} kg vs last week
+                    </span>
+                  )}
+                  {l.plateau && <Badge tone="warning">Plateau</Badge>}
+                  {l.deload && <Badge tone="warning">Deload</Badge>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+    </Section>
   );
 }
 
@@ -88,6 +162,7 @@ export function DashboardView() {
 
       {data && data.exercises.length > 0 && (
         <>
+          <StatsRow streak={data.streak} protein={data.protein} />
           <Section
             title="Next session"
             action={
@@ -130,6 +205,8 @@ export function DashboardView() {
               />
             )}
           </Section>
+
+          <ThisWeek />
         </>
       )}
     </>

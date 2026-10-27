@@ -63,7 +63,48 @@ def format_logged(r: Result) -> str:
     """log_workout result -> 'Saved bench 2026-10-27: 60 kg × 10, 10, 9'."""
     if r.get("status") != "ok":
         return r.get("message", "Nothing saved.")
-    return "\n".join(f"Saved {e['exercise']} {format_session(e)}" for e in r["logged"])
+    lines = [f"Saved {e['exercise']} {format_session(e)}" for e in r["logged"]]
+    lines += [format_milestone(m) for m in r.get("milestones", [])]
+    return "\n".join(lines)
+
+
+def format_milestone(m: Result) -> str:
+    return (f"🏆 New best for {m['exercise']}: e1RM {kg(m['e1rm_kg'])} "
+            f"(previous best {kg(m['previous_best_kg'])}, +{kg(m['gain_kg'])})")
+
+
+def format_protein_day(d: Result) -> str:
+    total = f"Protein {d['date']}: {kg(d['total_protein_g']).replace(' kg', ' g')}"
+    if d.get("target_g"):
+        total += f" of {d['target_g']:g} g target ({d['remaining_g']:g} g to go)"
+    if d.get("any_estimated"):
+        total += " - includes estimates"
+    if d.get("meals_missing_protein"):
+        total += f" - {d['meals_missing_protein']} meal(s) without a protein number"
+    return total
+
+
+def format_meal(r: Result) -> str:
+    if r.get("status") != "ok":
+        return r.get("message", "Nothing saved.")
+    m = r["meal"]
+    if m["protein_g"] is None:
+        line = f"Saved meal {m['id']}: {m['text']} - protein unknown"
+    else:
+        label = "estimated" if m["protein_estimated"] else "your number"
+        line = f"Saved meal {m['id']}: {m['text']} - {m['protein_g']:g} g protein ({label})"
+    parts = [line]
+    if r.get("breakdown"):
+        parts.append("  " + ", ".join(f"{i['food']} {i['amount']}: {i['protein_g']:g} g" for i in r["breakdown"]))
+    parts.append(format_protein_day(r["day"]))
+    return "\n".join(parts)
+
+
+def format_streak(r: Result) -> str:
+    c = r["consistency"]
+    pct = f"{c['percent']}%" if c["percent"] is not None else "no data yet"
+    return (f"🔥 Streak: {r['current_streak']} training days (best {r['best_streak']})\n"
+            f"Consistency, last {c['weeks']} weeks: {c['done']}/{c['planned']} days ({pct})")
 
 
 def format_progress(r: Result) -> str:
@@ -100,4 +141,8 @@ def format_any(tool_name: str, r: Result) -> str:
         "log_workout": format_logged,
         "get_progress": format_progress,
         "list_exercises": format_exercises,
+        "log_meal": format_meal,
+        "correct_meal_protein": lambda x: format_protein_day(x["day"]),
+        "protein_today": format_protein_day,
+        "get_streak": format_streak,
     }.get(tool_name, lambda x: f"Done: {x.get('exercise', tool_name)}")(r)

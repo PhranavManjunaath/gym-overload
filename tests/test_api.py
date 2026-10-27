@@ -145,8 +145,9 @@ def test_dashboard(SessionLocal: sessionmaker[Session]) -> None:
 
 
 def test_dashboard_empty(SessionLocal: sessionmaker[Session]) -> None:
-    assert client(SessionLocal).get("/api/dashboard").json() == \
-        {"status": "ok", "exercises": [], "next": [], "recent": []}
+    d = client(SessionLocal).get("/api/dashboard").json()
+    assert (d["exercises"], d["next"], d["recent"]) == ([], [], [])
+    assert d["streak"]["current_streak"] == 0 and d["protein"]["meals"] == []
 
 
 # ---------- coach ----------
@@ -183,12 +184,54 @@ def test_reminders_read_only(SessionLocal: sessionmaker[Session], monkeypatch: p
     for k in ["REMINDER_TIMEZONE", "WORKOUT_DAYS", "WORKOUT_REMINDER_TIME", "MISSED_WORKOUT_CHECK_TIME",
               "MEAL_REMINDER_TIMES"]:
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("WEEKLY_REPORT_TIME", raising=False)
     c = client(SessionLocal)
-    assert c.get("/api/reminders").json() == {
-        "status": "ok", "timezone": "Asia/Kolkata", "workout_days": ["mon", "wed", "fri"],
-        "workout_time": "07:00", "missed_check_time": "21:00", "meal_times": ["08:00", "13:00", "20:00"],
-        "note": "Change them in .env and restart the bot."}
-    assert c.post("/api/reminders").status_code == 405          # no fake "save"
+    r = c.get("/api/reminders").json()
+    assert {k: r[k] for k in ["timezone", "workout_days", "workout_time", "missed_check_time",
+                              "weekly_report_time", "meal_times", "daily_cap"]} == {
+        "timezone": "Asia/Kolkata", "workout_days": ["mon", "wed", "fri"], "workout_time": "07:00",
+        "missed_check_time": "21:00", "weekly_report_time": "19:00", "meal_times": ["08:00", "13:00", "20:00"],
+        "daily_cap": 2}
+    assert c.post("/api/reminders").status_code == 405          # edited via /api/settings instead
+
+
+# ---------- Phase 4/5 endpoints ----------
+
+def test_settings_round_trip_and_all_or_nothing(SessionLocal: sessionmaker[Session],
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    for k in ["WORKOUT_DAYS", "WORKOUT_REMINDER_TIME"]:
+        monkeypatch.delenv(k, raising=False)
+    c = client(SessionLocal)
+    s = c.post("/api/settings", json={"training_days": "tue,thu", "workout_time": "18:30",
+                                      "protein_target_g": 140, "goal": "bench 100 kg"}).json()
+    assert (s["training_days"], s["workout_time"], s["protein_target_g"], s["goal"]) == \
+        (["tue", "thu"], "18:30", 140.0, "bench 100 kg")
+    bad = c.post("/api/settings", json={"training_days": "mon", "protein_target_g": 0}).json()
+    assert bad["status"] == "error"
+    assert c.get("/api/settings").json()["training_days"] == ["tue", "thu"]      # nothing half-saved
+    assert c.get("/api/reminders").json()["workout_days"] == ["tue", "thu"]
+
+
+def test_meals_endpoints(SessionLocal: sessionmaker[Session]) -> None:
+    c = client(SessionLocal)
+    m = c.post("/api/meals", json={"text": "2 eggs + 1 scoop whey"}).json()
+    assert (m["meal"]["protein_g"], m["meal"]["protein_estimated"]) == (36.0, True)
+    fixed = c.post(f"/api/meals/{m['meal']['id']}/protein", json={"protein_g": 40}).json()
+    assert fixed["day"]["total_protein_g"] == 40.0
+    assert [x["protein_estimated"] for x in c.get("/api/meals").json()["meals"]] == [False]
+
+
+def test_streak_report_and_export(SessionLocal: sessionmaker[Session]) -> None:
+    seed(SessionLocal, "bench 60x10,10,10 2026-10-26")
+    c = client(SessionLocal)
+    assert c.get("/api/streak").json()["current_streak"] == 1
+    rep = c.get("/api/report").json()
+    assert rep["sessions_logged"] == 1 and rep["text"].startswith("📅 Week 2026-10-26 to 2026-11-01")
+    csv_resp = c.get("/api/export/workouts.csv")
+    assert csv_resp.headers["content-type"].startswith("text/csv")
+    assert "attachment" in csv_resp.headers["content-disposition"]
+    assert csv_resp.text.splitlines()[1].startswith("2026-10-26,bench,1,60.0,10")
+    assert c.get("/api/export/passwords.csv").status_code == 404
 
 
 def test_api_never_imports_bot() -> None:

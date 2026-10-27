@@ -203,3 +203,41 @@ def test_history_is_trimmed() -> None:
     trimmed = agent._trim(msgs, turn_start=78)
     assert len(trimmed) <= agent.MAX_HISTORY and isinstance(trimmed[0], HumanMessage)
     assert trimmed[-2].content == "q39"
+
+
+# ---------- Phase 3: memory, new tools, trace ----------
+
+def test_long_term_memory_is_in_the_prompt_and_numbers_from_it_are_allowed(SessionLocal: sessionmaker[Session]) -> None:
+    with SessionLocal.begin() as s:
+        tools.set_goal(s, "bench 100 kg by June")
+        tools.save_preference(s, "dislikes", "lunges")
+    c, llm = coach(SessionLocal, [AIMessage("Your goal is a 100 kg bench - let's get there!")])
+    reply = c.chat(1, "what's my goal?")
+    system = llm.seen[0][0].content
+    assert "Goal: bench 100 kg by June" in system and "Preference - dislikes: lunges" in system
+    assert reply == "Your goal is a 100 kg bench - let's get there!"      # 100 comes from memory, not invented
+
+
+def test_meal_tool_and_numbers_used(SessionLocal: sessionmaker[Session]) -> None:
+    c, _ = coach(SessionLocal, [
+        call("log_meal", text="chicken breast 200g, 2 eggs"),
+        AIMessage("Logged - 74 g protein estimated for that meal."),
+    ])
+    reply = c.chat(1, "lunch was chicken breast 200g, 2 eggs")
+    assert "74 g protein (estimated)" in reply
+
+
+def test_meal_tool_rejects_retyped_text(SessionLocal: sessionmaker[Session]) -> None:
+    c, _ = coach(SessionLocal, [call("log_meal", text="chicken breast 500g"), AIMessage("Hmm, please resend.")])
+    c.chat(1, "chicken breast 200g")
+    with SessionLocal() as s:
+        assert tools.protein_day(s, TODAY)["meals"] == []
+
+
+def test_last_trace_records_tools_and_outputs(SessionLocal: sessionmaker[Session]) -> None:
+    with SessionLocal.begin() as s:
+        tools.log_workout(s, "bench 62.5x7,7,7 2026-10-13", today=TODAY)
+    c, _ = coach(SessionLocal, [call("check_plateau", exercise="bench"), AIMessage("No plateau yet.")])
+    c.chat(1, "am I stuck on bench?")
+    assert c.last_trace["tools"] == ["check_plateau"]
+    assert '"plateau": false' in c.last_trace["tool_outputs"][0] and c.last_trace["retries"] == 0

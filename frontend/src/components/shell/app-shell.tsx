@@ -12,6 +12,7 @@ import {
   Settings,
   Target,
   TrendingUp,
+  Utensils,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -26,6 +27,7 @@ const NAV: NavItem[] = [
   { href: "/next", label: "Next session", icon: Target, mobileTab: "Next" },
   { href: "/progress", label: "Progress", icon: TrendingUp, mobileTab: "Progress" },
   { href: "/exercises", label: "Exercises", icon: Dumbbell },
+  { href: "/nutrition", label: "Nutrition", icon: Utensils },
   { href: "/coach", label: "AI coach", icon: MessageSquare },
   { href: "/settings", label: "Settings", icon: Settings },
 ];

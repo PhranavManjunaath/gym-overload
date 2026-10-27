@@ -90,9 +90,53 @@ def test_every_handler_is_locked_to_my_chat(SessionLocal: sessionmaker[Session])
                                 settings=scheduler.ReminderSettings.from_env({}))
     handlers = app.handlers[0]
     commands = {c for h in handlers if isinstance(h, CommandHandler) for c in h.commands}
-    assert commands == {"start", "help", "next", "progress", "exercises", "reminders"}
+    assert commands == {"start", "help", "next", "progress", "exercises", "reminders", "meal", "fixmeal",
+                        "setprotein", "protein", "streak", "schedule", "plan", "goal", "report", "export"}
     for h in handlers[:-1]:
         assert repr(h.filters).startswith(("filters.Chat(42)", "<<filters.Chat(42) and")), h
     # the last handler only catches strangers (everyone except chat 42) and just logs them
     assert isinstance(handlers[-1], MessageHandler)
     assert repr(handlers[-1].filters) == "<inverted filters.Chat(42)>"
+
+
+# ---------- Phase 4/5 commands ----------
+
+def test_meal_fixmeal_and_protein(SessionLocal: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch) -> None:
+    assert bot.reply_setprotein(SessionLocal, ["140g"]) == "Protein target set to 140 g a day."
+    out = bot.reply_meal(SessionLocal, ["chicken", "breast", "200g,", "2", "eggs"], today=TODAY)
+    assert "74 g protein (estimated)" in out and "Wrong? /fixmeal 1 <grams>" in out
+    unknown = bot.reply_meal(SessionLocal, ["pizza"], today=TODAY)
+    assert "protein unknown" in unknown and "/fixmeal 2 <grams>" in unknown
+    fixed = bot.reply_fixmeal(SessionLocal, ["2", "30"])
+    assert fixed.startswith("Meal 2 updated to 30 g (your number).")
+    day = bot.reply_protein(SessionLocal, today=TODAY)
+    assert "Protein 2026-10-27: 104 g of 140 g target (36 g to go)" in day
+    assert "[1] chicken breast 200g, 2 eggs: 74 g est." in day and "[2] pizza: 30 g" in day
+
+
+def test_command_usage_messages(SessionLocal: sessionmaker[Session]) -> None:
+    assert bot.reply_meal(SessionLocal, []).startswith("Usage")
+    assert bot.reply_fixmeal(SessionLocal, ["x"]).startswith("Usage")
+    assert bot.reply_setprotein(SessionLocal, ["lots"]).startswith("Usage")
+    assert bot.reply_plan(SessionLocal, ["mon"]).startswith("Usage")
+
+
+def test_schedule_plan_goal_streak(SessionLocal: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WORKOUT_DAYS", raising=False)
+    monkeypatch.delenv("WORKOUT_REMINDER_TIME", raising=False)
+    assert bot.reply_schedule(SessionLocal, ["tue,fri", "18:30"]).startswith("Training days: tue, fri · reminder 18:30")
+    assert bot.reply_schedule(SessionLocal, ["funday"]).startswith("Bad training days 'funday'")
+    assert bot.reply_plan(SessionLocal, ["fri", "bench", "press"]) == "fri: bench press"
+    assert "fri: bench press" in bot.reply_schedule(SessionLocal, [])
+    assert bot.reply_goal(SessionLocal, ["bench", "100", "kg"]) == "Goal saved: bench 100 kg"
+    # sessions on Tue 20 and Fri 23 = both tue/fri training days completed; today (Tue 27) not over yet
+    assert bot.reply_streak(SessionLocal, today=TODAY).startswith("🔥 Streak: 2 training days (best 2)")
+
+
+def test_report_and_export(SessionLocal: sessionmaker[Session]) -> None:
+    report = bot.reply_report(SessionLocal, summarize=None, today=dt.date(2026, 10, 25))
+    assert report.startswith("📅 Week 2026-10-19 to 2026-10-25") and "bench press: best e1RM 80 kg" in report
+    files = dict(bot.export_files(SessionLocal))
+    assert files["workouts.csv"].splitlines()[0] == "date,exercise,set,weight_kg,reps,rpe,deload"
+    assert len(files["workouts.csv"].splitlines()) == 7                 # header + 6 sets
+    assert files["meals.csv"].splitlines() == ["date,meal_id,text,protein_g,protein_estimated"]

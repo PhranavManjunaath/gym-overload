@@ -1,14 +1,22 @@
 """
-Scheduler - workout and meal reminders for consistency (APScheduler).
+Scheduler - consistency messages (APScheduler), at most 2 per day.
 
-Settings come from .env (defaults in brackets):
-    REMINDER_TIMEZONE           [Asia/Kolkata]
-    WORKOUT_DAYS                [mon,wed,fri]
-    WORKOUT_REMINDER_TIME       [07:00]   - today's targets, straight from the engine
-    MISSED_WORKOUT_CHECK_TIME   [21:00]   - nudge only if nothing was logged today
-    MEAL_REMINDER_TIMES         [08:00,13:00,20:00]  (empty = no meal reminders)
+One job runs every minute and asks plan_messages() what is due. plan_messages is a
+pure function of (time, schedule, what was already sent today, whether you trained),
+so every rule is testable with fake dates:
 
-Reminder texts are built in plain Python - no LLM, so the targets are exact.
+    workout_reminder  training day, at your reminder time, until the nudge time,
+                      skipped if you already logged today - includes today's targets
+                      from recommend_next and your streak
+    missed_nudge      training day, nothing logged by the nudge time (21:00) - once
+    weekly_report     Sunday at WEEKLY_REPORT_TIME (19:00) - numbers from Python
+    meal_HHMM         meal reminders, lowest priority, only within an hour of their time,
+                      and only if they don't use up a slot a workout message may still need
+
+Training days and reminder time come from the app (/schedule) and fall back to .env:
+    REMINDER_TIMEZONE [Asia/Kolkata]   WORKOUT_DAYS [mon,wed,fri]   WORKOUT_REMINDER_TIME [07:00]
+    MISSED_WORKOUT_CHECK_TIME [21:00]  WEEKLY_REPORT_TIME [19:00]   MEAL_REMINDER_TIMES [08:00,13:00,20:00]
+Messages are sent by the Telegram bot and recorded, so a restart never sends twice.
 """
 from __future__ import annotations
 
@@ -16,18 +24,22 @@ import asyncio
 import datetime as dt
 import os
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, List, Mapping, Optional
+from typing import Awaitable, Callable, List, Mapping, Optional, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session, sessionmaker
 
+import analytics
 import db as storage
 import formatting
+import reports
 import tools
 
-DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+DAYS = analytics.WEEKDAYS
+DAILY_CAP = 2
+MEAL_WINDOW = dt.timedelta(hours=1)
 Send = Callable[[str], Awaitable[None]]
 
 
@@ -38,6 +50,7 @@ class ReminderSettings:
     workout_time: dt.time = dt.time(7, 0)
     missed_check_time: dt.time = dt.time(21, 0)
     meal_times: List[dt.time] = field(default_factory=lambda: [dt.time(8), dt.time(13), dt.time(20)])
+    weekly_report_time: dt.time = dt.time(19, 0)
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "ReminderSettings":
@@ -50,6 +63,7 @@ class ReminderSettings:
             missed_check_time=_parse_time(env.get("MISSED_WORKOUT_CHECK_TIME", "21:00")),
             meal_times=[_parse_time(t) for t in env.get("MEAL_REMINDER_TIMES", "08:00,13:00,20:00").split(",")
                         if t.strip()],
+            weekly_report_time=_parse_time(env.get("WEEKLY_REPORT_TIME", "19:00")),
         )
         try:
             ZoneInfo(s.timezone)
@@ -59,33 +73,77 @@ class ReminderSettings:
 
 
 def _parse_time(text: str) -> dt.time:
-    try:
-        return dt.datetime.strptime(text.strip(), "%H:%M").time()
-    except ValueError:
-        raise ValueError(f"Bad time '{text}' - use 24h HH:MM, e.g. 07:30.") from None
+    return analytics.parse_time(text)
 
 
 def _parse_days(text: str) -> List[str]:
-    days = [d.strip().lower()[:3] for d in text.split(",") if d.strip()]
-    bad = [d for d in days if d not in DAYS]
-    if bad or not days:
-        raise ValueError(f"Bad WORKOUT_DAYS '{text}' - use e.g. mon,wed,fri.")
-    return sorted(set(days), key=DAYS.index)
+    try:
+        return analytics.parse_days(text)
+    except ValueError:
+        raise ValueError(f"Bad WORKOUT_DAYS '{text}' - use e.g. mon,wed,fri.") from None
 
 
-# ---------- reminder texts ----------
+# ---------- what is due (pure, testable) ----------
 
-def workout_reminder_text(session: Session) -> str:
-    exercises = tools.list_exercises(session)["exercises"]
+def plan_messages(now: dt.datetime, training_days: Sequence[str], workout_time: dt.time,
+                  settings: ReminderSettings, sent_today: Sequence[str], logged_today: bool) -> List[str]:
+    """Kinds of message to send right now, in order, never exceeding DAILY_CAP per day."""
+    t, today = now.time(), now.date()
+    training = analytics.is_training_day(today, training_days)
+    sunday = today.weekday() == 6
+    sent = list(sent_today)
+    budget = DAILY_CAP - len(sent)
+    if budget <= 0:
+        return []
+
+    due_important = []
+    if training and not logged_today and "workout_reminder" not in sent \
+            and workout_time <= t < settings.missed_check_time:
+        due_important.append("workout_reminder")
+    if sunday and "weekly_report" not in sent and t >= settings.weekly_report_time:
+        due_important.append("weekly_report")
+    if training and not logged_today and "missed_nudge" not in sent and t >= settings.missed_check_time:
+        due_important.append("missed_nudge")
+    out = due_important[:budget]
+    budget -= len(out)
+
+    # Important messages that could still come later today keep their slot.
+    later = 0
+    if training and not logged_today and "workout_reminder" not in sent + out and t < workout_time:
+        later += 1
+    if training and not logged_today and "missed_nudge" not in sent + out and t < settings.missed_check_time:
+        later += 1
+    if sunday and "weekly_report" not in sent + out and t < settings.weekly_report_time:
+        later += 1
+
+    for mt in settings.meal_times:
+        kind = f"meal_{mt.strftime('%H%M')}"
+        start = dt.datetime.combine(today, mt, tzinfo=now.tzinfo)
+        if kind not in sent and start <= now < start + MEAL_WINDOW and budget - later > 0:
+            out.append(kind)
+            budget -= 1
+    return out
+
+
+# ---------- message texts ----------
+
+def workout_reminder_text(session: Session, today: Optional[dt.date] = None) -> str:
+    today = today or dt.date.today()
+    sched = tools.get_schedule(session)
+    planned = sched["day_plan"].get(analytics.weekday(today))
+    exercises = planned or [e["exercise"] for e in tools.list_exercises(session)["exercises"]]
     if not exercises:
         return "🏋️ Workout day! Add your exercises first, e.g. 'add bench press, barbell'."
     lines = ["🏋️ Workout day! Today's targets:"]
-    for e in exercises:
-        r = tools.recommend_next(session, e["exercise"])
+    for name in exercises:
+        r = tools.recommend_next(session, name)
         if r["status"] == "ok":
-            lines.append(f"  • {e['exercise']}: {formatting.format_targets(r['next'])} ({r['rule']})")
+            lines.append(f"  • {name}: {formatting.format_targets(r['next'])} ({r['rule']})")
         else:
-            lines.append(f"  • {e['exercise']}: no history yet - tell me your starting weight")
+            lines.append(f"  • {name}: no history yet - tell me your starting weight")
+    st = tools.streak(session, today)
+    if st["current_streak"]:
+        lines.append(f"🔥 {st['current_streak']}-day streak - keep it going!")
     lines.append("Log it after, e.g. 'bench 60x10,10,9'.")
     return "\n".join(lines)
 
@@ -93,7 +151,9 @@ def workout_reminder_text(session: Session) -> str:
 def missed_workout_text(session: Session, today: dt.date) -> Optional[str]:
     if storage.count_sessions_on(session, today) > 0:
         return None
-    return "⏰ No workout logged today. Did you train? Send it now, e.g. 'bench 60x10,10,9'."
+    st = tools.streak(session, today)
+    keep = f" Your {st['current_streak']}-day streak is on the line." if st["current_streak"] else ""
+    return f"⏰ No workout logged today.{keep} Trained? Send it now, e.g. 'bench 60x10,10,9'."
 
 
 def meal_reminder_text(t: dt.time) -> str:
@@ -101,49 +161,63 @@ def meal_reminder_text(t: dt.time) -> str:
     return f"🍽 {meal.capitalize()} time - eat a protein-rich meal and drink some water."
 
 
-def describe(s: ReminderSettings) -> str:
+def describe(s: ReminderSettings, training_days: Optional[Sequence[str]] = None,
+             workout_time: Optional[str] = None) -> str:
     hm = lambda t: t.strftime("%H:%M")
+    days = ", ".join(training_days if training_days is not None else s.workout_days)
     meals = ", ".join(hm(t) for t in s.meal_times) or "off"
-    return (f"Reminders ({s.timezone}):\n"
-            f"  • Workout days: {', '.join(s.workout_days)} at {hm(s.workout_time)}\n"
+    return (f"Reminders ({s.timezone}), max {DAILY_CAP} messages a day:\n"
+            f"  • Workout days: {days} at {workout_time or hm(s.workout_time)}\n"
             f"  • Missed-workout check: {hm(s.missed_check_time)} on workout days\n"
-            f"  • Meals: {meals}\n"
-            "Change them in .env and restart the bot.")
+            f"  • Weekly report: Sunday {hm(s.weekly_report_time)}\n"
+            f"  • Meals: {meals} (only if a slot is free)\n"
+            "Change days/time with /schedule; the rest in .env (restart the bot).")
+
+
+def message_text(session: Session, kind: str, today: dt.date,
+                 summarize: Optional[reports.Summarize] = None) -> Optional[str]:
+    if kind == "workout_reminder":
+        return workout_reminder_text(session, today)
+    if kind == "missed_nudge":
+        return missed_workout_text(session, today)
+    if kind == "weekly_report":
+        return reports.weekly_report(session, today, summarize)
+    if kind.startswith("meal_"):
+        return meal_reminder_text(dt.datetime.strptime(kind[5:], "%H%M").time())
+    return None
 
 
 # ---------- scheduler ----------
 
-def build_scheduler(send: Send, SessionLocal: sessionmaker[Session], settings: ReminderSettings) -> AsyncIOScheduler:
-    """Scheduler with all reminder jobs added (not started - call .start() inside the event loop)."""
+def tick(SessionLocal: sessionmaker[Session], settings: ReminderSettings, now: dt.datetime,
+         summarize: Optional[reports.Summarize] = None) -> List[str]:
+    """Decide and build what's due now; records each message as sent. Returns the texts."""
+    today = now.date()
+    with SessionLocal() as s:
+        sched = tools.get_schedule(s)
+        kinds = plan_messages(now, sched["training_days"], analytics.parse_time(sched["workout_time"]), settings,
+                              storage.notifications_on(s, today), storage.count_sessions_on(s, today) > 0)
+        texts = []
+        for kind in kinds:
+            text = message_text(s, kind, today, summarize)
+            storage.record_notification(s, today, kind)          # recorded even if skipped: never retried
+            if text:
+                texts.append(text)
+        s.commit()
+    return texts
+
+
+def build_scheduler(send: Send, SessionLocal: sessionmaker[Session], settings: ReminderSettings,
+                    summarize: Optional[reports.Summarize] = None) -> AsyncIOScheduler:
+    """Scheduler with the every-minute check (not started - call .start() inside the event loop)."""
     tz = ZoneInfo(settings.timezone)
-    days = ",".join(settings.workout_days)
 
-    def with_session(fn: Callable[[Session], Optional[str]]) -> Optional[str]:
-        with SessionLocal() as s:
-            return fn(s)
-
-    async def workout_job() -> None:
-        await send(await asyncio.to_thread(with_session, workout_reminder_text))
-
-    async def missed_job() -> None:
-        today = dt.datetime.now(tz).date()
-        text = await asyncio.to_thread(with_session, lambda s: missed_workout_text(s, today))
-        if text:
+    async def check() -> None:
+        texts = await asyncio.to_thread(tick, SessionLocal, settings, dt.datetime.now(tz), summarize)
+        for text in texts:
             await send(text)
 
-    def meal_job(t: dt.time) -> Callable[[], Awaitable[None]]:
-        async def job() -> None:
-            await send(meal_reminder_text(t))
-        return job
-
     sched = AsyncIOScheduler(timezone=tz)
-    sched.add_job(workout_job, CronTrigger(day_of_week=days, hour=settings.workout_time.hour,
-                                           minute=settings.workout_time.minute, timezone=tz),
-                  id="workout_reminder", misfire_grace_time=600)
-    sched.add_job(missed_job, CronTrigger(day_of_week=days, hour=settings.missed_check_time.hour,
-                                          minute=settings.missed_check_time.minute, timezone=tz),
-                  id="missed_workout_check", misfire_grace_time=600)
-    for t in settings.meal_times:
-        sched.add_job(meal_job(t), CronTrigger(hour=t.hour, minute=t.minute, timezone=tz),
-                      id=f"meal_{t.strftime('%H%M')}", misfire_grace_time=600)
+    sched.add_job(check, IntervalTrigger(minutes=1, timezone=tz), id="consistency_check",
+                  max_instances=1, coalesce=True, misfire_grace_time=60)
     return sched

@@ -38,7 +38,12 @@ Based on: 2026-10-27: 60 kg × 10, 10, 10 (RPE 8, 8, 8)
 | Progress | Weight / e1RM / volume charts, history | `/progress bench` | Charts + history |
 | Exercises | Search + add form | "add squat, barbell" | Form |
 | AI coach | Chat with a "Numbers used" panel | every text message | Chat page |
-| Reminders | Read-only Settings page | ✅ sends them (APScheduler) | - |
+| Streak & consistency | Dashboard stats + "This week" card | `/streak`, in reminders | Progress page |
+| Protein tracking | Nutrition page (add, correct, target) | `/meal`, `/fixmeal`, `/setprotein`, `/protein` | - |
+| Weekly report | "This week" card | Sunday 19:00 + `/report` | - |
+| Schedule | Settings (days, time, goal) | `/schedule`, `/plan`, `/goal` | - |
+| Export CSV | Settings → Your data | `/export` | Progress page |
+| Reminders | Shown in Settings | ✅ sends them (max 2/day) | - |
 
 None of the front ends import each other; they share the database, tools, engine and
 agent, so the numbers always match. The website is the main UI; the Streamlit app is kept
@@ -54,10 +59,28 @@ Telegram ─▶ bot.py ─▶ agent.py (LangGraph: agent ⇄ tools ─▶ verify
                 │            └─▶ tools.py ─▶ progression_engine.py (all math)
                 │                     └────▶ db.py ─▶ Supabase Postgres (or SQLite)
                 ├─▶ /next /progress: tools.py directly (no LLM)
-                └─▶ scheduler.py (APScheduler): workout, missed-workout and meal reminders
+                └─▶ scheduler.py (APScheduler, 1-min check, max 2 msgs/day):
+                      workout reminder, 9 pm nudge, Sunday report, meal reminders
 parser.py: "bench 60x10,10,9 @8" ─▶ exact sets (regex, no LLM)
+analytics.py: streaks, consistency, e1RM milestones, trend summaries (plain Python)
+nutrition.py: "chicken 200g, 2 eggs" ─▶ protein from a fixed food table (no LLM, labelled estimated)
+reports.py: weekly report numbers + CSV export (LLM summary only if every number checks out)
 formatting.py: tool results ─▶ plain text (no LLM)
 ```
+
+## Agent (LangGraph + Groq)
+
+19 tools, each a thin wrapper around tested Python: `log_workout`, `get_history`, `recommend_next`,
+`check_plateau`, `progress_summary`, `update_exercise_settings`, `save_preference`, `set_goal`,
+`set_schedule`, `set_day_plan`, `get_streak`, `log_meal`, `correct_meal_protein`, `set_protein_target`,
+`protein_today`, `add_exercise`, `list_exercises`, `get_progress`, `plan_first_session`.
+
+**Long-term memory:** goal, exercises, schedule, per-day plan, protein target and saved preferences
+are loaded from the database into the prompt every turn.
+
+**Evaluation** (`python -m tests.eval_agent`, real Groq, throwaway DB): 20 messages with the expected
+tool, reporting tool-selection accuracy and a "no hallucinated numbers" check (every number in the
+reply must appear in a tool output, the message or the saved memory).
 
 ## Progression method (double progression)
 

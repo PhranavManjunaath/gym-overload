@@ -5,16 +5,19 @@ Only answers TELEGRAM_CHAT_ID (your own chat); everyone else is ignored.
     plain text            -> the coach (agent.py), e.g. "bench 60x10,10,9" or "what's next for squat?"
     /next <exercise>      -> next target, straight from the engine (no LLM)
     /progress <exercise>  -> last sessions: weight, reps, volume, e1RM (no LLM)
+    /meal, /fixmeal, /setprotein, /protein, /streak, /schedule, /plan, /goal, /report, /export
     /exercises, /reminders, /help
-Reminders (scheduler.py) start with the bot.
+Reminders (scheduler.py, max 2 a day) start with the bot.
 """
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import io
 import logging
 import os
 import re
-from typing import Callable, List, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session, sessionmaker
@@ -25,6 +28,7 @@ import agent
 import db as storage
 import formatting
 import parser as workout_parser
+import reports
 import scheduler
 import tools
 
@@ -39,14 +43,31 @@ HELP_TEXT = (
     "Commands:\n"
     "  /next <exercise> - next target with the rule and data behind it\n"
     "  /progress <exercise> - your last sessions\n"
+    "  /streak - training streak and consistency\n"
+    "  /meal <text> - log a meal, e.g. /meal chicken 200g, 2 eggs (protein is estimated)\n"
+    "  /fixmeal <id> <grams> - correct a meal's protein\n"
+    "  /setprotein <grams> - your daily protein target\n"
+    "  /protein - today's protein vs your target\n"
+    "  /schedule [days] [HH:MM] - e.g. /schedule mon,wed,fri 07:30\n"
+    "  /plan <day> <exercises> - e.g. /plan mon bench press, squat\n"
+    "  /goal <text> - your training goal\n"
+    "  /report - this week's report\n"
+    "  /export - your data as CSV\n"
     "  /exercises - your exercises and settings\n"
-    "  /reminders - when I'll remind you\n"
+    "  /reminders - when I'll remind you (max 2 messages a day)\n"
     "  /help - this message"
 )
 
 COMMANDS = [
     BotCommand("next", "Next target for an exercise"),
     BotCommand("progress", "Last sessions for an exercise"),
+    BotCommand("streak", "Training streak"),
+    BotCommand("meal", "Log a meal"),
+    BotCommand("protein", "Today's protein"),
+    BotCommand("report", "This week's report"),
+    BotCommand("schedule", "Training days and reminder time"),
+    BotCommand("plan", "Exercises for a weekday"),
+    BotCommand("export", "Download your data (CSV)"),
     BotCommand("exercises", "Your exercises"),
     BotCommand("reminders", "Reminder schedule"),
     BotCommand("help", "How to use the coach"),
@@ -103,10 +124,116 @@ def reply_exercises(SessionLocal: sessionmaker[Session]) -> str:
         return formatting.format_exercises(tools.list_exercises(s))
 
 
+def _run(SessionLocal: sessionmaker[Session], fn: Callable[..., Dict[str, Any]], **kwargs: Any) -> Dict[str, Any]:
+    """One tool call = one transaction: commit on success, roll back otherwise."""
+    with SessionLocal() as s:
+        r = fn(s, **kwargs)
+        if r.get("status") == "ok":
+            s.commit()
+        else:
+            s.rollback()
+        return r
+
+
+def _number(text: str) -> Optional[float]:
+    try:
+        return float(text.lower().removesuffix("g"))
+    except ValueError:
+        return None
+
+
+def reply_meal(SessionLocal: sessionmaker[Session], args: Sequence[str], today: Optional[dt.date] = None) -> str:
+    text = " ".join(args).strip()
+    if not text:
+        return "Usage: /meal <what you ate>, e.g. /meal chicken breast 200g, 2 eggs (or add '35g protein')"
+    r = _run(SessionLocal, tools.log_meal, text=text, today=today)
+    out = formatting.format_meal(r)
+    if r.get("status") == "ok" and r["meal"]["protein_g"] is None:
+        out += f"\nFix it with /fixmeal {r['meal']['id']} <grams>"
+    elif r.get("status") == "ok" and r["meal"]["protein_estimated"]:
+        out += f"\nWrong? /fixmeal {r['meal']['id']} <grams>"
+    return out
+
+
+def reply_fixmeal(SessionLocal: sessionmaker[Session], args: Sequence[str]) -> str:
+    if len(args) != 2 or not args[0].isdigit() or _number(args[1]) is None:
+        return "Usage: /fixmeal <meal id> <grams>, e.g. /fixmeal 12 35"
+    r = _run(SessionLocal, tools.correct_meal_protein, meal_id=int(args[0]), protein_g=_number(args[1]))
+    if r["status"] != "ok":
+        return r["message"]
+    return f"Meal {r['meal']['id']} updated to {r['meal']['protein_g']:g} g (your number).\n" + \
+        formatting.format_protein_day(r["day"])
+
+
+def reply_setprotein(SessionLocal: sessionmaker[Session], args: Sequence[str]) -> str:
+    grams = _number(args[0]) if len(args) == 1 else None
+    if grams is None:
+        return "Usage: /setprotein <grams per day>, e.g. /setprotein 140"
+    r = _run(SessionLocal, tools.set_protein_target, grams=grams)
+    return f"Protein target set to {r['target_g']:g} g a day." if r["status"] == "ok" else r["message"]
+
+
+def reply_protein(SessionLocal: sessionmaker[Session], today: Optional[dt.date] = None) -> str:
+    r = _run(SessionLocal, tools.protein_day, day=today)
+    lines = [formatting.format_protein_day(r)]
+    for m in r["meals"]:
+        p = "?" if m["protein_g"] is None else f"{m['protein_g']:g} g" + (" est." if m["protein_estimated"] else "")
+        lines.append(f"  • [{m['id']}] {m['text']}: {p}")
+    if not r["target_g"]:
+        lines.append("Set your own target with /setprotein <grams>.")
+    return "\n".join(lines)
+
+
+def reply_streak(SessionLocal: sessionmaker[Session], today: Optional[dt.date] = None) -> str:
+    return formatting.format_streak(_run(SessionLocal, tools.streak, today=today))
+
+
+def reply_schedule(SessionLocal: sessionmaker[Session], args: Sequence[str]) -> str:
+    days = next((a for a in args if ":" not in a), None)
+    time = next((a for a in args if ":" in a), None)
+    if days is None and time is None:
+        r = _run(SessionLocal, tools.get_schedule)
+    else:
+        r = _run(SessionLocal, tools.set_schedule, training_days=days, workout_time=time)
+        if r["status"] != "ok":
+            return r["message"] + "\nUsage: /schedule mon,wed,fri 07:30"
+    plan = "".join(f"\n  • {d}: {', '.join(n)}" for d, n in r["day_plan"].items())
+    return (f"Training days: {', '.join(r['training_days'])} · reminder {r['workout_time']}"
+            + (f"\nPlan:{plan}" if plan else "\nNo per-day plan yet - /plan mon bench press, squat"))
+
+
+def reply_plan(SessionLocal: sessionmaker[Session], args: Sequence[str]) -> str:
+    if len(args) < 2:
+        return "Usage: /plan <day> <exercises>, e.g. /plan mon bench press, squat"
+    names = [n.strip() for n in " ".join(args[1:]).split(",") if n.strip()]
+    r = _run(SessionLocal, tools.set_day_plan, day=args[0], exercises=names)
+    return f"{r['day']}: {', '.join(r['exercises'])}" if r["status"] == "ok" else r["message"]
+
+
+def reply_goal(SessionLocal: sessionmaker[Session], args: Sequence[str]) -> str:
+    if not args:
+        with SessionLocal() as s:
+            return f"Goal: {storage.get_setting(s, 'goal') or 'not set'} - change it with /goal <text>"
+    r = _run(SessionLocal, tools.set_goal, goal=" ".join(args))
+    return f"Goal saved: {r['goal']}" if r["status"] == "ok" else r["message"]
+
+
+def reply_report(SessionLocal: sessionmaker[Session], summarize: Optional[reports.Summarize] = None,
+                 today: Optional[dt.date] = None) -> str:
+    with SessionLocal() as s:
+        return reports.weekly_report(s, today or dt.date.today(), summarize)
+
+
+def export_files(SessionLocal: sessionmaker[Session]) -> List[tuple]:
+    with SessionLocal() as s:
+        return [("workouts.csv", reports.export_workouts_csv(s)), ("meals.csv", reports.export_meals_csv(s))]
+
+
 # ---------- wiring ----------
 
 def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Session],
-                      coach: agent.Coach, settings: scheduler.ReminderSettings) -> Application:
+                      coach: agent.Coach, settings: scheduler.ReminderSettings,
+                      summarize: Optional[reports.Summarize] = None) -> Application:
     me = filters.Chat(chat_id=chat_id)
 
     async def send(text: str) -> None:
@@ -132,6 +259,14 @@ def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Sessi
                      "/next and /progress still work without it.")
         await answer(update, reply)
 
+    async def on_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        for name, content in await asyncio.to_thread(export_files, SessionLocal):
+            await update.effective_message.reply_document(document=io.BytesIO(content.encode("utf-8")), filename=name)
+
+    def reminders_text() -> str:
+        sched = _run(SessionLocal, tools.get_schedule)
+        return scheduler.describe(settings, sched["training_days"], sched["workout_time"])
+
     async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("Ignored message from unknown chat %s", update.effective_chat.id if update.effective_chat else "?")
 
@@ -140,10 +275,10 @@ def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Sessi
 
     async def on_start(application: Application) -> None:
         await application.bot.set_my_commands(COMMANDS)
-        sched = scheduler.build_scheduler(send, SessionLocal, settings)
+        sched = scheduler.build_scheduler(send, SessionLocal, settings, summarize)
         sched.start()
         application.bot_data["scheduler"] = sched
-        log.info("Bot online. %s", scheduler.describe(settings).replace("\n", " "))
+        log.info("Bot online. %s", reminders_text().replace("\n", " "))
 
     async def on_stop(application: Application) -> None:
         sched = application.bot_data.get("scheduler")
@@ -155,7 +290,17 @@ def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Sessi
     app.add_handler(CommandHandler("next", command(lambda a: reply_next(SessionLocal, a)), filters=me))
     app.add_handler(CommandHandler("progress", command(lambda a: reply_progress(SessionLocal, a)), filters=me))
     app.add_handler(CommandHandler("exercises", command(lambda a: reply_exercises(SessionLocal)), filters=me))
-    app.add_handler(CommandHandler("reminders", command(lambda a: scheduler.describe(settings)), filters=me))
+    app.add_handler(CommandHandler("reminders", command(lambda a: reminders_text()), filters=me))
+    app.add_handler(CommandHandler("meal", command(lambda a: reply_meal(SessionLocal, a)), filters=me))
+    app.add_handler(CommandHandler("fixmeal", command(lambda a: reply_fixmeal(SessionLocal, a)), filters=me))
+    app.add_handler(CommandHandler("setprotein", command(lambda a: reply_setprotein(SessionLocal, a)), filters=me))
+    app.add_handler(CommandHandler("protein", command(lambda a: reply_protein(SessionLocal)), filters=me))
+    app.add_handler(CommandHandler("streak", command(lambda a: reply_streak(SessionLocal)), filters=me))
+    app.add_handler(CommandHandler("schedule", command(lambda a: reply_schedule(SessionLocal, a)), filters=me))
+    app.add_handler(CommandHandler("plan", command(lambda a: reply_plan(SessionLocal, a)), filters=me))
+    app.add_handler(CommandHandler("goal", command(lambda a: reply_goal(SessionLocal, a)), filters=me))
+    app.add_handler(CommandHandler("report", command(lambda a: reply_report(SessionLocal, summarize)), filters=me))
+    app.add_handler(CommandHandler("export", on_export, filters=me))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~me, on_stranger))
     app.add_error_handler(on_error)
@@ -177,9 +322,11 @@ def main() -> None:
     engine = storage.get_engine()
     log.info("Database: %s", storage.describe_engine(engine))
     SessionLocal = storage.make_session_factory(engine)
-    coach = agent.create_coach(SessionLocal)
+    llm = agent.build_llm()
+    coach = agent.Coach(llm, SessionLocal)
+    summarize = lambda prompt: str(llm.invoke(prompt).content)     # checked by reports.summarize_checked
 
-    build_application(token, int(chat_id), SessionLocal, coach, settings).run_polling(
+    build_application(token, int(chat_id), SessionLocal, coach, settings, summarize).run_polling(
         allowed_updates=Update.ALL_TYPES)
 
 

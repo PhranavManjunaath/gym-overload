@@ -17,11 +17,14 @@ Each call is one transaction: on failure nothing is saved. The caller commits on
 from __future__ import annotations
 
 import datetime as dt
+import os
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+import analytics
 import db as storage
+import nutrition
 import parser as workout_parser
 import progression_engine as pe
 
@@ -125,11 +128,16 @@ def log_workout(session: Session, text: str, today: Optional[dt.date] = None) ->
         session.rollback()
         return {"status": "error", "message": f"Nothing saved: {err}"}
 
-    logged = []
+    logged, milestones = [], []
     for e in entries:
         s = pe.Session(e.date.isoformat(), e.sets, e.is_deload)
         logged.append({"exercise": e.exercise, **_session(s), "volume_kg": pe.volume_load(s)})
-    return {"status": "ok", "logged": logged}
+        history = storage.get_history(session, e.exercise)
+        others = list(history)
+        others.remove(s)                       # the session just saved (dataclasses compare by value)
+        if m := analytics.e1rm_milestone(others + [s], s):
+            milestones.append({"exercise": e.exercise, "date": s.date, **m})
+    return {"status": "ok", "logged": logged, "milestones": milestones}
 
 
 def recommend_next(session: Session, exercise: str) -> Result:
@@ -198,3 +206,211 @@ def get_progress(session: Session, exercise: str, last_n: Optional[int] = None) 
          "total_reps": pe.total_reps(s), "volume_kg": pe.volume_load(s), "best_e1rm_kg": pe.best_e1rm(s)}
         for s in history
     ]}
+
+
+# ---------- history & analysis ----------
+
+def get_history(session: Session, exercise: str, n: int = 5) -> Result:
+    """The last `n` sessions of an exercise with every set, newest last."""
+    try:
+        cfg = storage.get_config(session, exercise)
+    except storage.ExerciseNotFound:
+        return _unknown(exercise)
+    if n < 1:
+        return {"status": "error", "message": "n must be at least 1."}
+    history = storage.get_history(session, cfg.name)[-n:]
+    return {"status": "ok", "exercise": cfg.name, "sessions": [_session(s) for s in history]}
+
+
+def check_plateau(session: Session, exercise: str) -> Result:
+    """Plateau check from the engine: same weight with no gain in total reps over the window."""
+    try:
+        cfg = storage.get_config(session, exercise)
+    except storage.ExerciseNotFound:
+        return _unknown(exercise)
+    history = storage.get_history(session, cfg.name)
+    if not history:
+        return {"status": "error", "message": f"No sessions logged for {cfg.name} yet."}
+    window = [s for s in history if not s.is_deload][-cfg.plateau_window:]
+    return {"status": "ok", "exercise": cfg.name, "plateau": pe.detect_plateau(cfg, history),
+            "rule": f"Plateau = {cfg.plateau_window} sessions in a row at the same weight with no gain "
+                    f"in total reps (counted since the last deload).",
+            "sessions_checked": [_session(s) for s in window]}
+
+
+def progress_summary(session: Session, exercise: str, weeks: int = 4,
+                     today: Optional[dt.date] = None) -> Result:
+    """e1RM trend, volume trend and best set over the last `weeks` weeks (computed in Python)."""
+    try:
+        cfg = storage.get_config(session, exercise)
+    except storage.ExerciseNotFound:
+        return _unknown(exercise)
+    if not 1 <= weeks <= 104:
+        return {"status": "error", "message": "weeks must be between 1 and 104."}
+    summary = analytics.progress_summary(storage.get_history(session, cfg.name), today or dt.date.today(), weeks)
+    return {"status": "ok", "exercise": cfg.name, **summary}
+
+
+def update_exercise_settings(session: Session, exercise: str, rep_min: Optional[int] = None,
+                             rep_max: Optional[int] = None, increment_kg: Optional[float] = None,
+                             target_sets: Optional[int] = None) -> Result:
+    """Change rep range / weight jump / sets. Settings left empty stay the same."""
+    try:
+        ex = storage.update_exercise_settings(session, exercise, rep_min, rep_max, increment_kg, target_sets)
+    except storage.ExerciseNotFound:
+        return _unknown(exercise)
+    except ValueError as e:
+        session.rollback()
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "exercise": ex.name, "settings": _settings(storage.get_config(session, ex.name))}
+
+
+# ---------- long-term memory ----------
+
+def save_preference(session: Session, key: str, value: str) -> Result:
+    """Remember something about the user, e.g. key='dislikes', value='lunges'."""
+    try:
+        p = storage.save_preference(session, key, value)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "key": p.key, "value": p.value}
+
+
+def set_goal(session: Session, goal: str) -> Result:
+    goal = goal.strip()
+    if not goal:
+        return {"status": "error", "message": "Goal can't be empty."}
+    storage.set_setting(session, "goal", goal[:300])
+    return {"status": "ok", "goal": goal[:300]}
+
+
+def _default_days() -> List[str]:
+    try:
+        return analytics.parse_days(os.environ.get("WORKOUT_DAYS", "mon,wed,fri"))
+    except ValueError:
+        return ["mon", "wed", "fri"]
+
+
+def _default_time() -> str:
+    try:
+        return analytics.parse_time(os.environ.get("WORKOUT_REMINDER_TIME", "07:00")).strftime("%H:%M")
+    except ValueError:
+        return "07:00"
+
+
+def get_schedule(session: Session) -> Result:
+    """Training days, reminder time and per-day exercise plan (app settings, else .env defaults)."""
+    days = storage.get_setting(session, "training_days")
+    time = storage.get_setting(session, "workout_time")
+    return {"status": "ok",
+            "training_days": analytics.parse_days(days) if days else _default_days(),
+            "workout_time": time or _default_time(),
+            "day_plan": storage.get_day_plan(session),
+            "source": "app" if days or time else "defaults"}
+
+
+def set_schedule(session: Session, training_days: Optional[str] = None, workout_time: Optional[str] = None) -> Result:
+    """Set training days ('mon,wed,fri') and/or the reminder time ('07:30')."""
+    try:
+        if training_days is not None:
+            storage.set_setting(session, "training_days", ",".join(analytics.parse_days(training_days)))
+        if workout_time is not None:
+            storage.set_setting(session, "workout_time", analytics.parse_time(workout_time).strftime("%H:%M"))
+    except ValueError as e:
+        session.rollback()
+        return {"status": "error", "message": str(e)}
+    return get_schedule(session)
+
+
+def set_day_plan(session: Session, day: str, exercises: List[str]) -> Result:
+    """Which exercises are trained on a weekday - used for that day's reminder."""
+    try:
+        names = storage.set_day_plan(session, day, exercises)
+    except storage.ExerciseNotFound as e:
+        session.rollback()
+        return {"status": "unknown_exercise", "message": str(e)}
+    except ValueError as e:
+        session.rollback()
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "day": day.strip().lower()[:3], "exercises": names}
+
+
+def streak(session: Session, today: Optional[dt.date] = None) -> Result:
+    """Current/best streak of completed training days and consistency over the last 4 weeks."""
+    today = today or dt.date.today()
+    days = get_schedule(session)["training_days"]
+    logged = storage.session_dates(session)
+    return {"status": "ok", "training_days": days,
+            "current_streak": analytics.current_streak(days, logged, today),
+            "best_streak": analytics.best_streak(days, logged, today),
+            "consistency": analytics.consistency(days, logged, today),
+            "logged_today": today in logged}
+
+
+def memory_context(session: Session) -> str:
+    """Goal, schedule, protein target and preferences - loaded into the agent's prompt every turn."""
+    sched = get_schedule(session)
+    names = [e.name for e in storage.list_exercises(session)]
+    lines = [f"Goal: {storage.get_setting(session, 'goal') or 'not set'}",
+             f"Exercises set up (exact names for tools): {', '.join(names) if names else 'none yet'}",
+             f"Training days: {', '.join(sched['training_days'])} (reminder {sched['workout_time']})"]
+    for day, names in sched["day_plan"].items():
+        lines.append(f"Plan {day}: {', '.join(names)}")
+    target = storage.get_setting(session, "protein_target_g")
+    lines.append(f"Protein target: {target + ' g/day' if target else 'not set'}")
+    prefs = storage.list_preferences(session)
+    lines += [f"Preference - {p.key}: {p.value}" for p in prefs] or ["Preferences: none saved"]
+    return "\n".join(lines)
+
+
+# ---------- meals & protein (tracking only - no diet advice) ----------
+
+def _meal(m: storage.Meal) -> Dict[str, Any]:
+    return {"id": m.id, "date": m.date.isoformat(), "text": m.text, "protein_g": m.protein_g,
+            "protein_estimated": m.protein_estimated}
+
+
+def protein_day(session: Session, day: Optional[dt.date] = None) -> Result:
+    """Meals on a day, total protein so far and the user's own target."""
+    day = day or dt.date.today()
+    meals = storage.meals_between(session, day, day)
+    known = [m.protein_g for m in meals if m.protein_g is not None]
+    target = storage.get_setting(session, "protein_target_g")
+    return {"status": "ok", "date": day.isoformat(), "meals": [_meal(m) for m in meals],
+            "total_protein_g": round(sum(known), 1),
+            "meals_missing_protein": sum(1 for m in meals if m.protein_g is None),
+            "any_estimated": any(m.protein_estimated and m.protein_g is not None for m in meals),
+            "target_g": float(target) if target else None,
+            "remaining_g": round(max(float(target) - sum(known), 0), 1) if target else None}
+
+
+def log_meal(session: Session, text: str, today: Optional[dt.date] = None) -> Result:
+    """Store a meal with protein estimated from a fixed food table (or the user's own number)."""
+    est = nutrition.estimate_protein(text)
+    try:
+        meal = storage.add_meal(session, today or dt.date.today(), text, est.protein_g, est.estimated)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    out: Result = {"status": "ok", "meal": _meal(meal), "breakdown": est.items, "unknown_items": est.unknown}
+    if est.protein_g is None:
+        out["message"] = (f"Couldn't estimate protein for: {', '.join(est.unknown)}. "
+                          f"Tell me the grams and I'll store your number (meal {meal.id}).")
+    out["day"] = protein_day(session, meal.date)
+    return out
+
+
+def correct_meal_protein(session: Session, meal_id: int, protein_g: float) -> Result:
+    """Replace a meal's protein with the user's own number."""
+    try:
+        meal = storage.set_meal_protein(session, meal_id, protein_g)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "meal": _meal(meal), "day": protein_day(session, meal.date)}
+
+
+def set_protein_target(session: Session, grams: float) -> Result:
+    """The user's own daily protein target (grams)."""
+    if not 0 < grams <= 500:
+        return {"status": "error", "message": "Protein target must be between 1 and 500 g."}
+    storage.set_setting(session, "protein_target_g", f"{grams:g}")
+    return {"status": "ok", "target_g": float(grams)}

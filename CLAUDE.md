@@ -55,6 +55,14 @@ plus workout/diet reminders for consistency. Portfolio project.
   Frontend checks: `npx tsc --noEmit`, `npm run lint`, `npm run build`.
 - Single-user only: WEB_PASSWORD is a shared password, not real accounts. Don't
   claim multi-user auth exists until it's built and tested.
+- `analytics.py` (streaks, consistency, milestones, summaries), `nutrition.py`
+  (protein from a fixed food table - never the LLM; unknown food -> None, ask the
+  user) and `reports.py` (weekly report, CSV) are plain Python with fake-date tests.
+  The LLM may only write the weekly summary FROM the stats; it's dropped if it has
+  any number not in them.
+- Proactive messages: max 2 per day (`scheduler.plan_messages`, a pure function).
+  Workout reminder / weekly report / missed nudge outrank meal reminders.
+- Agent evaluation with the real LLM: `python -m tests.eval_agent` (manual, not pytest).
 - The agent's `verify` node rejects any reply containing a number not found in a
   tool result or user message; keep it. Agent tests use a scripted fake LLM —
   never call Groq from pytest.

@@ -158,8 +158,11 @@ def test_progress_metrics_and_history(db_url: str) -> None:
     at = page("progress")
     assert at.selectbox[0].options == ["bench", "squat"]
     assert any("62.5 kg × 6, 6, 6" in m.value for m in at.markdown)
-    assert [m.value for m in at.metric] == ["60 kg", "30", "1800 kg", "80 kg"]
+    assert [m.label for m in at.metric][:3] == ["🔥 Training streak", "Best streak",
+                                                "Consistency (last 4 weeks)"]
+    assert [m.value for m in at.metric][3:] == ["60 kg", "30", "1800 kg", "80 kg"]
     assert len(at.dataframe[0].value) == 2
+    assert [b.label for b in at.get("download_button")] == ["⬇️ Workouts CSV", "⬇️ Meals CSV"]
     at.selectbox[0].select("squat").run()
     assert not at.exception
     assert "starting weight" in at.info[0].value

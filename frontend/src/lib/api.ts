@@ -70,8 +70,62 @@ export type Reminders = {
   workout_days: string[];
   workout_time: string;
   missed_check_time: string;
+  weekly_report_time: string;
   meal_times: string[];
+  daily_cap: number;
   note: string;
+};
+export type Streak = {
+  training_days: string[];
+  current_streak: number;
+  best_streak: number;
+  consistency: { done: number; planned: number; percent: number | null; weeks: number };
+  logged_today: boolean;
+};
+export type Meal = { id: number; date: string; text: string; protein_g: number | null; protein_estimated: boolean };
+export type ProteinDay = {
+  date: string;
+  meals: Meal[];
+  total_protein_g: number;
+  meals_missing_protein: number;
+  any_estimated: boolean;
+  target_g: number | null;
+  remaining_g: number | null;
+};
+export type MealResult = {
+  meal: Meal;
+  breakdown: { food: string; amount: string; protein_g: number }[];
+  unknown_items: string[];
+  message?: string;
+  day: ProteinDay;
+};
+export type WeeklyLift = {
+  exercise: string;
+  sessions: number;
+  best_e1rm_kg: number;
+  previous_week_best_e1rm_kg: number | null;
+  change_kg: number | null;
+  plateau: boolean;
+  deload: boolean;
+};
+export type WeeklyReport = {
+  week: string;
+  training_days_planned: number;
+  training_days_done: number;
+  sessions_logged: number;
+  total_volume_kg: number;
+  lifts: WeeklyLift[];
+  protein: { on_target: number; days: number; target_g: number } | null;
+  streak: number;
+  text: string;
+};
+export type AppSettings = {
+  training_days: string[];
+  workout_time: string;
+  day_plan: Record<string, string[]>;
+  source: "app" | "defaults";
+  goal: string | null;
+  protein_target_g: number | null;
 };
 
 // ---------- transport ----------
@@ -125,7 +179,31 @@ export const api = {
   auth: () => request<Ok<{ password_required: boolean }>>("/api/auth"),
   meta: () => request<Ok<Meta>>("/api/meta"),
   dashboard: () =>
-    request<Ok<{ exercises: Exercise[]; next: Recommendation[]; recent: RecentSession[] }>>("/api/dashboard"),
+    request<Ok<{ exercises: Exercise[]; next: Recommendation[]; recent: RecentSession[]; streak: Streak; protein: ProteinDay }>>(
+      "/api/dashboard",
+    ),
+  report: () => request<Ok<WeeklyReport>>("/api/report"),
+  meals: () => request<Ok<ProteinDay>>("/api/meals"),
+  addMeal: (text: string) => request<Result<MealResult>>("/api/meals", post({ text })),
+  fixMeal: (id: number, protein_g: number) =>
+    request<Result<{ meal: Meal; day: ProteinDay }>>(`/api/meals/${id}/protein`, post({ protein_g })),
+  settings: () => request<Ok<AppSettings>>("/api/settings"),
+  saveSettings: (body: { training_days?: string; workout_time?: string; protein_target_g?: number; goal?: string }) =>
+    request<Result<AppSettings>>("/api/settings", post(body)),
+  /** Download a CSV through fetch so the optional password header is sent too. */
+  download: async (kind: "workouts" | "meals") => {
+    let res: Response;
+    try {
+      res = await fetch(`${API_URL}/api/export/${kind}.csv`, { headers: { "X-App-Password": getStoredPassword() } });
+    } catch {
+      throw new ApiError(`Can't reach the API at ${API_URL}. Is it running?`);
+    }
+    if (!res.ok) throw new ApiError(`Export failed (${res.status}).`);
+    const url = URL.createObjectURL(await res.blob());
+    const a = Object.assign(document.createElement("a"), { href: url, download: `gym-overload-${kind}.csv` });
+    a.click();
+    URL.revokeObjectURL(url);
+  },
   exercises: () => request<Ok<{ exercises: Exercise[] }>>("/api/exercises"),
   addExercise: (body: {
     name: string;

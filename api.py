@@ -14,7 +14,7 @@ import hmac
 import os
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,6 +23,7 @@ import agent
 import db as storage
 import parser as workout_parser
 import progression_engine as pe
+import reports
 import scheduler
 import tools
 
@@ -48,6 +49,21 @@ class ExerciseIn(BaseModel):
 
 class StartIn(BaseModel):
     starting_weight_kg: float
+
+
+class MealIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+
+class ProteinIn(BaseModel):
+    protein_g: float
+
+
+class SettingsIn(BaseModel):
+    training_days: Optional[str] = None             # "mon,wed,fri"
+    workout_time: Optional[str] = None              # "07:30"
+    protein_target_g: Optional[float] = None
+    goal: Optional[str] = Field(default=None, max_length=300)
 
 
 class ChatIn(BaseModel):
@@ -128,8 +144,68 @@ def create_app(
                 for e in exercises
                 for sess in tools.get_progress(s, e["exercise"], last_n=RECENT_LIMIT)["sessions"]
             ]
+            streak = tools.streak(s, today())
+            protein = tools.protein_day(s, today())
         recent.sort(key=lambda x: (x["date"], x["exercise"]), reverse=True)
-        return {"status": "ok", "exercises": exercises, "next": nxt, "recent": recent[:RECENT_LIMIT]}
+        return {"status": "ok", "exercises": exercises, "next": nxt, "recent": recent[:RECENT_LIMIT],
+                "streak": streak, "protein": protein}
+
+    @r.get("/streak")
+    def streak() -> Result:
+        return run(tools.streak, today=today())
+
+    @r.get("/report")
+    def report() -> Result:
+        """This week's numbers (Python only - the LLM summary is a Telegram-only extra)."""
+        with SessionLocal() as s:
+            st = reports.weekly_stats(s, today())
+            return {"status": "ok", **st, "text": reports.stats_text(st)}
+
+    @r.get("/meals")
+    def meals_today(day: Optional[dt.date] = None) -> Result:
+        return run(tools.protein_day, day=day or today())
+
+    @r.post("/meals")
+    def add_meal(body: MealIn) -> Result:
+        return run(tools.log_meal, text=body.text, today=today())
+
+    @r.post("/meals/{meal_id}/protein")
+    def fix_meal(meal_id: int, body: ProteinIn) -> Result:
+        return run(tools.correct_meal_protein, meal_id=meal_id, protein_g=body.protein_g)
+
+    @r.get("/settings")
+    def get_settings() -> Result:
+        with SessionLocal() as s:
+            target = storage.get_setting(s, "protein_target_g")
+            return {**tools.get_schedule(s), "goal": storage.get_setting(s, "goal"),
+                    "protein_target_g": float(target) if target else None}
+
+    @r.post("/settings")
+    def save_settings(body: SettingsIn) -> Result:
+        """All-or-nothing: any invalid field and nothing is saved."""
+        with SessionLocal() as s:
+            steps = []
+            if body.training_days is not None or body.workout_time is not None:
+                steps.append(tools.set_schedule(s, body.training_days, body.workout_time))
+            if body.protein_target_g is not None:
+                steps.append(tools.set_protein_target(s, body.protein_target_g))
+            if body.goal is not None and body.goal.strip():
+                steps.append(tools.set_goal(s, body.goal))
+            failed = next((x for x in steps if x["status"] != "ok"), None)
+            if failed:
+                s.rollback()
+                return failed
+            s.commit()
+        return get_settings()
+
+    @r.get("/export/{kind}.csv")
+    def export(kind: str) -> Response:
+        if kind not in ("workouts", "meals"):
+            raise HTTPException(status_code=404, detail="Unknown export.")
+        with SessionLocal() as s:
+            body = reports.export_workouts_csv(s) if kind == "workouts" else reports.export_meals_csv(s)
+        return Response(body, media_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="gym-overload-{kind}.csv"'})
 
     @r.get("/exercises")
     def list_exercises() -> Result:
@@ -205,11 +281,15 @@ def create_app(
             st = scheduler.ReminderSettings.from_env()
         except ValueError as e:
             return {"status": "error", "message": str(e)}
+        with SessionLocal() as s:
+            sched = tools.get_schedule(s)
         hm = lambda t: t.strftime("%H:%M")
-        return {"status": "ok", "timezone": st.timezone, "workout_days": st.workout_days,
-                "workout_time": hm(st.workout_time), "missed_check_time": hm(st.missed_check_time),
-                "meal_times": [hm(t) for t in st.meal_times],
-                "note": "Change them in .env and restart the bot."}
+        return {"status": "ok", "timezone": st.timezone, "workout_days": sched["training_days"],
+                "workout_time": sched["workout_time"], "missed_check_time": hm(st.missed_check_time),
+                "weekly_report_time": hm(st.weekly_report_time),
+                "meal_times": [hm(t) for t in st.meal_times], "daily_cap": scheduler.DAILY_CAP,
+                "note": "Training days and reminder time are set here; the other times in .env "
+                        "(restart the bot)."}
 
     app.include_router(r)
     return app

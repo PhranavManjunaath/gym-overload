@@ -35,14 +35,20 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 MAX_HISTORY = 30          # messages sent to the LLM per call (older ones are dropped)
 MAX_RETRIES = 1           # rewrites allowed when the reply has an ungrounded number
 VERIFIER = "verifier"     # name on the correction message verify sends back to the LLM
-EVIDENCE_TOOLS = ("log_workout", "recommend_next", "plan_first_session")
+EVIDENCE_TOOLS = ("log_workout", "recommend_next", "plan_first_session", "log_meal", "correct_meal_protein")
 
 SYSTEM_PROMPT = """You are a strength coach inside a Telegram chat. Today is {today}.
 
+WHAT YOU KNOW ABOUT THE USER (long-term memory, from the database):
+{memory}
+
 HARD RULES
-1. Never calculate, estimate or invent any number (weights, reps, sets, e1RM, volume, percentages, dates).
+1. Always call a tool for any number. Never calculate, estimate or invent any number
+   (weights, reps, sets, e1RM, volume, protein, percentages, dates, streaks).
    Every number you write must be copied exactly from a tool result or the user's message.
-   If you need a number, call a tool.
+   When giving a recommendation, quote the tool output numbers exactly.
+   If a tool returns an error, say so plainly - never fill the gap with made-up data.
+   If the exercise or the data is unclear, ask a short question instead of guessing.
 2. To save a workout, call log_workout with the workout part of the user's message copied
    character for character (e.g. "bench 60x10,10,9 @8"). Never fix or change it.
    On parse_error, show the message and ask the user to resend.
@@ -57,6 +63,21 @@ HARD RULES
    ask only "barbell, dumbbell or other?". Pass only settings the user actually stated.
    If the user sent a workout for an exercise that wasn't set up, log it again after adding
    (call log_workout with the same text from their earlier message).
+7. Which tool (exercise names are listed in your memory above - use them directly, don't call
+   list_exercises just to look a name up):
+   • past sessions / "what did I do" -> get_history
+   • "am I stuck / plateau" -> check_plateau
+   • trends over weeks, best set, "how am I progressing" -> progress_summary
+   • change rep range, weight jump or sets -> update_exercise_settings
+   • a lasting fact about the user (likes, dislikes, injuries, equipment) -> save_preference;
+     their training goal -> set_goal
+   • training days or reminder time -> set_schedule; exercises for a weekday -> set_day_plan
+   • streak or consistency -> get_streak
+   • a meal they ate -> log_meal (pass the meal text exactly); fixing a meal's protein ->
+     correct_meal_protein; protein target -> set_protein_target; protein so far today -> protein_today
+8. Protein numbers come only from the tools (a fixed food table, labelled "estimated"). If a meal
+   can't be estimated, ask the user for the grams. Track against the user's own target only:
+   never give calorie-restriction or diet advice.
 
 STYLE: short, friendly, plain text - no markdown (no **bold**, *italics*, # headings or `code`).
 Use bullets (•), never numbered lists, no tables, no JSON.
@@ -158,11 +179,72 @@ def build_tools(SessionLocal: sessionmaker[Session],
         return run(tools.list_exercises)
 
     def get_progress(exercise: str, last_n: Optional[int] = None) -> str:
-        """Per-session history for an exercise: working weight, total reps, volume, best e1RM."""
+        """Per-session chart data for an exercise: working weight, total reps, volume, best e1RM."""
         return run(tools.get_progress, exercise=exercise, last_n=last_n)
 
+    def get_history(exercise: str, n: int = 5) -> str:
+        """The last n logged sessions of an exercise with every set (weight, reps, RPE)."""
+        return run(tools.get_history, exercise=exercise, n=n)
+
+    def check_plateau(exercise: str) -> str:
+        """Whether an exercise has plateaued (engine rule), with the sessions checked."""
+        return run(tools.check_plateau, exercise=exercise)
+
+    def progress_summary(exercise: str, weeks: int = 4) -> str:
+        """Trend over the last `weeks` weeks: e1RM change, volume change, total volume, best set."""
+        return run(tools.progress_summary, exercise=exercise, weeks=weeks, today=today())
+
+    def update_exercise_settings(exercise: str, rep_min: Optional[int] = None, rep_max: Optional[int] = None,
+                                 increment_kg: Optional[float] = None, target_sets: Optional[int] = None) -> str:
+        """Change an exercise's rep range, weight jump (kg) or number of sets. Pass only what the user stated."""
+        return run(tools.update_exercise_settings, exercise=exercise, rep_min=rep_min, rep_max=rep_max,
+                   increment_kg=increment_kg, target_sets=target_sets)
+
+    def save_preference(key: str, value: str) -> str:
+        """Remember a lasting fact about the user, e.g. key='dislikes', value='lunges'."""
+        return run(tools.save_preference, key=key, value=value)
+
+    def set_goal(goal: str) -> str:
+        """Save the user's training goal in their own words."""
+        return run(tools.set_goal, goal=goal)
+
+    def set_schedule(training_days: Optional[str] = None, workout_time: Optional[str] = None) -> str:
+        """Set training days (e.g. 'mon,wed,fri') and/or the daily reminder time (24h 'HH:MM')."""
+        return run(tools.set_schedule, training_days=training_days, workout_time=workout_time)
+
+    def set_day_plan(day: str, exercises: List[str]) -> str:
+        """Set which exercises are trained on a weekday (mon..sun) - used in that day's reminder."""
+        return run(tools.set_day_plan, day=day, exercises=exercises)
+
+    def get_streak() -> str:
+        """Current and best streak of completed training days, and consistency over 4 weeks."""
+        return run(tools.streak, today=today())
+
+    def log_meal(text: str, state: Annotated[dict, InjectedState]) -> str:
+        """Save a meal. `text` = the meal from the user's latest message, copied exactly
+        (e.g. 'chicken 200g, 2 eggs'). Protein is estimated in Python from a food table."""
+        if not any(_squash(text) in _squash(t) for t in _recent_user_texts(state)):
+            return json.dumps({"status": "error", "message": "Nothing saved: meal text must be copied exactly "
+                               "from the user's message."})
+        return run(tools.log_meal, text=text, today=today())
+
+    def correct_meal_protein(meal_id: int, protein_g: float) -> str:
+        """Replace a meal's protein with the grams the user stated."""
+        return run(tools.correct_meal_protein, meal_id=meal_id, protein_g=protein_g)
+
+    def set_protein_target(grams: float) -> str:
+        """Save the user's own daily protein target in grams (only a number the user stated)."""
+        return run(tools.set_protein_target, grams=grams)
+
+    def protein_today() -> str:
+        """Today's meals, total protein so far and the user's target."""
+        return run(tools.protein_day, day=today())
+
     return [StructuredTool.from_function(f) for f in
-            (log_workout, recommend_next, plan_first_session, add_exercise, list_exercises, get_progress)]
+            (log_workout, recommend_next, plan_first_session, add_exercise, list_exercises, get_progress,
+             get_history, check_plateau, progress_summary, update_exercise_settings, save_preference,
+             set_goal, set_schedule, set_day_plan, get_streak, log_meal, correct_meal_protein,
+             set_protein_target, protein_today)]
 
 
 # ---------- graph ----------
@@ -200,11 +282,12 @@ def fallback_reply(messages: List[BaseMessage], turn_start: int) -> str:
 
 
 def build_graph(llm: BaseChatModel, tool_list: List[BaseTool],
-                today: Callable[[], dt.date] = dt.date.today, checkpointer: Any = None) -> Any:
+                today: Callable[[], dt.date] = dt.date.today, checkpointer: Any = None,
+                memory: Callable[[], str] = lambda: "nothing saved yet") -> Any:
     llm_with_tools = llm.bind_tools(tool_list)
 
     def agent(state: CoachState) -> Dict[str, Any]:
-        system = SystemMessage(SYSTEM_PROMPT.format(today=today().isoformat()))
+        system = SystemMessage(SYSTEM_PROMPT.format(today=today().isoformat(), memory=memory()))
         reply = llm_with_tools.invoke([system] + _trim(state["messages"], state["turn_start"]))
         return {"messages": [reply]}
 
@@ -216,7 +299,7 @@ def build_graph(llm: BaseChatModel, tool_list: List[BaseTool],
         msgs = state["messages"]
         final = msgs[-1]
         sources = [_text(m) for m in msgs if _is_user(m) or isinstance(m, ToolMessage)]
-        sources.append(today().isoformat())
+        sources += [today().isoformat(), memory()]          # saved goal/target/schedule may be quoted
         bad = ungrounded_numbers(_text(final), sources)
         if not bad:
             return {}
@@ -251,7 +334,12 @@ class Coach:
 
     def __init__(self, llm: BaseChatModel, SessionLocal: sessionmaker[Session],
                  today: Callable[[], dt.date] = dt.date.today, checkpointer: Any = None) -> None:
-        self.graph = build_graph(llm, build_tools(SessionLocal, today), today, checkpointer)
+        def memory() -> str:
+            with SessionLocal() as s:
+                return tools.memory_context(s)
+
+        self.graph = build_graph(llm, build_tools(SessionLocal, today), today, checkpointer, memory)
+        self.last_trace: Dict[str, Any] = {}
 
     def chat(self, chat_id: int | str, text: str) -> str:
         config = {"configurable": {"thread_id": str(chat_id)}, "recursion_limit": 25}
@@ -259,6 +347,13 @@ class Coach:
         state = self.graph.invoke({"messages": [HumanMessage(text)], "turn_start": before, "retries": 0}, config)
         msgs = state["messages"]
         reply = _text(msgs[-1]).strip()
+        # For evaluation/debugging: which tools ran this turn and whether verify had to step in.
+        self.last_trace = {
+            "tools": [tc["name"] for m in msgs[before:] if isinstance(m, AIMessage) for tc in m.tool_calls],
+            "tool_outputs": [_text(m) for m in msgs[before:] if isinstance(m, ToolMessage)],
+            "retries": state.get("retries", 0),
+            "reply": reply,
+        }
         evidence = [formatting.format_any(name, r) for name, r in _turn_tool_results(msgs, before)
                     if name in EVIDENCE_TOOLS and r.get("status") == "ok"]
         if evidence and reply != fallback_reply(msgs, before):   # fallback already is the numbers
