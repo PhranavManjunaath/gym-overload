@@ -120,7 +120,15 @@ class SetEntry(Base):
 # ---------- engine / sessions ----------
 
 def resolve_database_url(url: str) -> str:
-    """Make a relative SQLite path relative to the project folder, not the current directory."""
+    """
+    - Postgres URLs as Supabase gives them (postgresql://, postgres://) -> use the psycopg driver.
+    - A relative SQLite path -> relative to the project folder, not the current directory.
+    """
+    url = url.strip()
+    # String replace, not make_url(): rendering a URL can re-encode the password.
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
     u = make_url(url)
     if u.get_backend_name() != "sqlite" or not u.database or u.database == ":memory:":
         return url
@@ -147,11 +155,23 @@ def get_engine(url: Optional[str] = None) -> Engine:
         url = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
     url = resolve_database_url(url)
     u = make_url(url)
-    if u.get_backend_name() == "sqlite" and u.database and u.database != ":memory:":
-        Path(u.database).parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(url)
+    if u.get_backend_name() == "sqlite":
+        if u.database and u.database != ":memory:":
+            Path(u.database).parent.mkdir(parents=True, exist_ok=True)
+        engine = create_engine(url)
+    else:
+        # pool_pre_ping: reconnect if the hosted DB (e.g. Supabase) dropped an idle connection.
+        engine = create_engine(url, pool_pre_ping=True)
     Base.metadata.create_all(engine)
     return engine
+
+
+def describe_engine(engine: Engine) -> str:
+    """Where we're connected, without the password - safe to print or log."""
+    u = engine.url
+    if u.get_backend_name() == "sqlite":
+        return f"sqlite file {u.database}"
+    return f"{u.get_backend_name()} at {u.host}:{u.port}/{u.database} as {u.username}"
 
 
 def make_session_factory(engine: Engine) -> sessionmaker[Session]:
@@ -275,3 +295,13 @@ def get_history(db: Session, exercise_name: str) -> List[pe.Session]:
         pe.Session(r.date.isoformat(), [pe.SetLog(s.weight, s.reps, s.rpe) for s in r.sets], r.is_deload)
         for r in rows
     ]
+
+
+# ---------- connection check (run: python db.py) ----------
+
+if __name__ == "__main__":
+    from sqlalchemy import inspect
+
+    eng = get_engine()
+    print("Connected:", describe_engine(eng))
+    print("Tables:", ", ".join(sorted(inspect(eng).get_table_names())))

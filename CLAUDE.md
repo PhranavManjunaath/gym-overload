@@ -30,8 +30,13 @@ plus workout/diet reminders for consistency. Portfolio project.
 
 ## TECH STACK
 
-- Python 3.11, SQLite (via SQLAlchemy), python-telegram-bot, LangGraph,
+- Python 3.11, SQLAlchemy, python-telegram-bot, LangGraph,
   LLM through Groq API (env var `GROQ_API_KEY`), APScheduler, Streamlit, pytest.
+- Database: Supabase (PostgreSQL, psycopg driver) for real data, set via
+  `DATABASE_URL` in `.env`. SQLite (`sqlite:///data/gym.db`) still works as a
+  local fallback. Tests always use throwaway local SQLite files — never the real DB.
+- Never print or log the database URL (it contains the password); use
+  `db.describe_engine()` instead.
 - Secrets only in a `.env` file (`.env` is in `.gitignore`). `.env.example` lists
   the required variables with placeholder values.
 

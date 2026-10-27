@@ -39,6 +39,27 @@ def test_relative_sqlite_path_resolves_to_project_folder() -> None:
     assert db.resolve_database_url("sqlite:///:memory:") == "sqlite:///:memory:"
 
 
+@pytest.mark.parametrize("url", [
+    "postgresql://postgres.ref:p%40ss@aws-0-x.pooler.supabase.com:5432/postgres",
+    "postgres://postgres.ref:p%40ss@aws-0-x.pooler.supabase.com:5432/postgres",
+    "postgresql+psycopg://postgres.ref:p%40ss@aws-0-x.pooler.supabase.com:5432/postgres",
+    "  postgresql://postgres.ref:p%40ss@aws-0-x.pooler.supabase.com:5432/postgres\n",
+])
+def test_supabase_url_uses_psycopg_and_keeps_password_untouched(url: str) -> None:
+    assert db.resolve_database_url(url) == \
+        "postgresql+psycopg://postgres.ref:p%40ss@aws-0-x.pooler.supabase.com:5432/postgres"
+
+
+def test_describe_engine_hides_password(tmp_path: Path) -> None:
+    from sqlalchemy import create_engine
+    pg = create_engine(db.resolve_database_url("postgresql://u:secret@host.example:5432/postgres"))
+    assert db.describe_engine(pg) == "postgresql at host.example:5432/postgres as u"
+    assert "secret" not in db.describe_engine(pg)
+    sq = db.get_engine(f"sqlite:///{(tmp_path / 'x.db').as_posix()}")
+    assert db.describe_engine(sq).startswith("sqlite file ")
+    sq.dispose()
+
+
 # ---------- exercises ----------
 
 def test_barbell_defaults(session: Session) -> None:
