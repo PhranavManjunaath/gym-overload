@@ -29,23 +29,25 @@ Rule: increase_weight - All working sets reached 10 reps (RPE <= 9 where logged)
 Based on: 2026-10-27: 60 kg × 10, 10, 10 (RPE 8, 8, 8)
 ```
 
-## Two ways to use it (separate, same data)
+## Ways to use it (separate front ends, same data)
 
-| | Telegram bot (`bot.py`) | App (`dashboard.py`) |
-|---|---|---|
-| Log workouts | send `bench 60x10,10,9` | Log page with a preview before saving |
-| Next targets | `/next bench` or ask | Next session page, with a "Why?" box for every lift |
-| Progress | `/progress bench` | Charts: weight, e1RM, volume + history |
-| Exercises | "add squat, barbell" | Exercises page with a form |
-| AI coach | every text message | AI coach page (its own conversation) |
-| Reminders | ✅ (APScheduler) | - |
+| | Website (`frontend/` + `api.py`) | Telegram bot (`bot.py`) | Streamlit app (`dashboard.py`) |
+|---|---|---|---|
+| Log workouts | Live preview → Save, set-by-set table | send `bench 60x10,10,9` | Preview before saving |
+| Next targets | Recommendation cards with an Evidence panel | `/next bench` or ask | "Why?" box per lift |
+| Progress | Weight / e1RM / volume charts, history | `/progress bench` | Charts + history |
+| Exercises | Search + add form | "add squat, barbell" | Form |
+| AI coach | Chat with a "Numbers used" panel | every text message | Chat page |
+| Reminders | Read-only Settings page | ✅ sends them (APScheduler) | - |
 
-The app never imports the bot; they run as separate processes and share the database,
-tools, engine and agent, so the numbers always match.
+None of the front ends import each other; they share the database, tools, engine and
+agent, so the numbers always match. The website is the main UI; the Streamlit app is kept
+as a simpler alternative.
 
 ## Architecture
 
 ```
+frontend/ (Next.js) ─HTTP─▶ api.py (FastAPI, no logic) ─▶ tools.py / agent.py
 dashboard.py + web/ (Streamlit app) ─▶ tools.py / agent.py   (same core, no bot)
 Telegram ─▶ bot.py ─▶ agent.py (LangGraph: agent ⇄ tools ─▶ verify) ─▶ Groq LLM
                 │            │
@@ -71,8 +73,9 @@ Defaults: 6-10 reps, 3 sets, +2.5 kg barbell, +2 kg dumbbell. e1RM (Epley) is fo
 
 ## Stack
 
-Python 3.11 · LangGraph · Groq (`openai/gpt-oss-120b`) · python-telegram-bot · SQLAlchemy ·
-Supabase Postgres · APScheduler · Streamlit · pytest
+Python 3.11 · FastAPI · LangGraph · Groq (`openai/gpt-oss-120b`) · python-telegram-bot ·
+SQLAlchemy · Supabase Postgres · APScheduler · Streamlit · pytest ·
+Next.js 16 · TypeScript · Tailwind CSS 4 · Lucide · Recharts
 
 ## Setup
 
@@ -88,12 +91,16 @@ pytest                      # no API keys needed - the LLM is faked in tests
 ## Run
 
 ```bash
-python bot.py                 # Telegram bot + reminders
-streamlit run dashboard.py    # the app → http://localhost:8501
+# Website (two terminals)
+uvicorn api:create_app --factory --host 127.0.0.1 --port 8000
+cd frontend && npm install && npm run dev      # → http://localhost:3000
+
+python bot.py                 # Telegram bot + reminders (separate)
+streamlit run dashboard.py    # Streamlit app → http://localhost:8501 (optional)
 ```
 
-The app only listens on this computer (`.streamlit/config.toml`). Set `WEB_PASSWORD` in `.env`
-to require a password.
+Everything listens on this computer only. Set `WEB_PASSWORD` in `.env` to require a
+password (a single shared password - this is a personal app, not multi-user yet).
 
 ## Telegram usage
 
@@ -107,4 +114,6 @@ Every module has tests in `tests/`: engine rules, parser formats and bad input, 
 tools (every rule returns its evidence), the agent graph (scripted fake LLM, including the
 made-up-number rewrite and fallback), reminders, bot replies and chat lock, and every app page
 (Streamlit `AppTest`: preview-before-save, never guessing a starting weight, password gate, and a
-check that the app never imports the bot).
+check that the app never imports the bot), and every API endpoint (preview never saves,
+future dates rejected, password required, coach evidence split, no fake "save" for reminders).
+The website is checked with `tsc`, ESLint and a production build.

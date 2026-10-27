@@ -8,3 +8,5 @@ streamlit>=1.38
 python-dotenv>=1.0
 pytest>=8.0
 tzdata>=2024.1
+fastapi>=0.115
+uvicorn>=0.30

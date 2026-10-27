@@ -48,6 +48,13 @@ plus workout/diet reminders for consistency. Portfolio project.
 - The app (`streamlit run dashboard.py`, pages in `web/`) is separate from the
   Telegram bot: it must never import `bot.py`. Both share db/tools/engine/agent.
   App pages only display results from `tools.py` — no math in the UI.
+- The website (`frontend/`, Next.js 16) talks only to `api.py` (FastAPI), a thin
+  layer over `tools.py` with no business logic. The frontend never calculates
+  workout numbers and never holds secrets. Read `frontend/AGENTS.md` and the docs
+  in `frontend/node_modules/next/dist/docs/` before changing Next.js code.
+  Frontend checks: `npx tsc --noEmit`, `npm run lint`, `npm run build`.
+- Single-user only: WEB_PASSWORD is a shared password, not real accounts. Don't
+  claim multi-user auth exists until it's built and tested.
 - The agent's `verify` node rejects any reply containing a number not found in a
   tool result or user message; keep it. Agent tests use a scripted fake LLM —
   never call Groq from pytest.
