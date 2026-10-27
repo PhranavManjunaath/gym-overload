@@ -62,6 +62,10 @@ plus workout/diet reminders for consistency. Portfolio project.
   any number not in them.
 - Proactive messages: max 2 per day (`scheduler.plan_messages`, a pure function).
   Workout reminder / weekly report / missed nudge outrank meal reminders.
+- Deployment (free, no card): `server.py` runs api.py + the bot in webhook mode +
+  `/cron/tick` (scheduler.tick, called by cron-job.org) in ONE Render web service
+  (`render.yaml`, see DEPLOY.md). `bot.py` polling stays for local use. Never put
+  secrets in URLs (the cron key goes in the `X-Cron-Key` header).
 - Agent evaluation with the real LLM: `python -m tests.eval_agent` (manual, not pytest).
 - The agent's `verify` node rejects any reply containing a number not found in a
   tool result or user message; keep it. Agent tests use a scripted fake LLM —

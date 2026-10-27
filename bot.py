@@ -295,7 +295,8 @@ def export_files(SessionLocal: sessionmaker[Session]) -> List[tuple]:
 
 def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Session],
                       coach: agent.Coach, settings: scheduler.ReminderSettings,
-                      summarize: Optional[reports.Summarize] = None) -> Application:
+                      summarize: Optional[reports.Summarize] = None, webhook: bool = False) -> Application:
+    """webhook=True: no polling updater - updates arrive via server.py's /telegram/webhook instead."""
     me = filters.Chat(chat_id=chat_id)
 
     async def send(text: str) -> None:
@@ -378,7 +379,10 @@ def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Sessi
         if sched:
             sched.shutdown(wait=False)
 
-    app = ApplicationBuilder().token(token).post_init(on_start).post_shutdown(on_stop).build()
+    builder = ApplicationBuilder().token(token).post_init(on_start).post_shutdown(on_stop)
+    if webhook:
+        builder = builder.updater(None)
+    app = builder.build()
     app.add_handler(CommandHandler(["start", "help"], command(lambda a: HELP_TEXT), filters=me))
     app.add_handler(CommandHandler("next", command(lambda a: reply_next(SessionLocal, a)), filters=me))
     app.add_handler(CommandHandler("progress", command(lambda a: reply_progress(SessionLocal, a)), filters=me))

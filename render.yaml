@@ -1,0 +1,34 @@
+# Render Blueprint - one FREE web service (no card): website API + Telegram bot (webhook) + reminders.
+# Reminders run when cron-job.org calls /cron/tick every 5 minutes (that also keeps the free service awake).
+# Secrets are NOT in this file: "sync: false" makes Render ask you for each value in its dashboard.
+services:
+  - type: web
+    name: gym-overload
+    runtime: python
+    plan: free
+    region: singapore            # same region as the Supabase database
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:create_server --factory --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: REMINDER_TIMEZONE
+        value: Asia/Kolkata
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET   # letters, digits, _ and - only (Telegram's rule)
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: WEB_PASSWORD
+        sync: false
+      - key: WEB_ORIGINS               # your Vercel address, e.g. https://gym-overload.vercel.app
+        sync: false
