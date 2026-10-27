@@ -91,8 +91,10 @@ def test_every_handler_is_locked_to_my_chat(SessionLocal: sessionmaker[Session])
     handlers = app.handlers[0]
     commands = {c for h in handlers if isinstance(h, CommandHandler) for c in h.commands}
     assert commands == {"start", "help", "next", "progress", "exercises", "reminders", "meal", "fixmeal",
-                        "setprotein", "protein", "streak", "schedule", "plan", "goal", "report", "export"}
-    for h in handlers[:-1]:
+                        "setprotein", "protein", "streak", "schedule", "plan", "goal", "report", "export",
+                        "resetday", "reset"}
+    # Commands and messages are filtered to chat 42; the button handler checks the chat id itself.
+    for h in [h for h in handlers[:-1] if hasattr(h, "filters")]:
         assert repr(h.filters).startswith(("filters.Chat(42)", "<<filters.Chat(42) and")), h
     # the last handler only catches strangers (everyone except chat 42) and just logs them
     assert isinstance(handlers[-1], MessageHandler)
@@ -140,3 +142,63 @@ def test_report_and_export(SessionLocal: sessionmaker[Session]) -> None:
     assert files["workouts.csv"].splitlines()[0] == "date,exercise,set,weight_kg,reps,rpe,deload"
     assert len(files["workouts.csv"].splitlines()) == 7                 # header + 6 sets
     assert files["meals.csv"].splitlines() == ["date,meal_id,text,protein_g,protein_estimated"]
+
+
+# ---------- /resetday and /reset ----------
+
+def test_parse_day() -> None:
+    assert bot.parse_day([], TODAY) == TODAY
+    assert bot.parse_day(["yesterday"], TODAY) == dt.date(2026, 10, 26)
+    assert bot.parse_day(["2026-10-23"], TODAY) == dt.date(2026, 10, 23)
+    assert bot.parse_day(["2026-10-28"], TODAY) is None          # future
+    assert bot.parse_day(["someday"], TODAY) is None
+
+
+def test_resetday_preview_lists_exactly_what_goes(SessionLocal: sessionmaker[Session]) -> None:
+    with SessionLocal.begin() as s:
+        tools.log_meal(s, "2 eggs", today=dt.date(2026, 10, 23))
+    text, day = bot.resetday_preview(SessionLocal, ["2026-10-23"], today=TODAY)
+    assert day == dt.date(2026, 10, 23)
+    assert "• bench press: 62.5 kg × 7, 6, 6" in text and "• meal: 2 eggs" in text
+    assert bot.resetday_preview(SessionLocal, [], today=TODAY) == ("Nothing is logged on 2026-10-27.", None)
+    assert bot.resetday_preview(SessionLocal, ["tomorrow"], today=TODAY)[1] is None
+
+
+def test_resetday_deletes_only_that_day(SessionLocal: sessionmaker[Session]) -> None:
+    with SessionLocal.begin() as s:
+        tools.log_meal(s, "2 eggs", today=dt.date(2026, 10, 23))
+        tools.log_meal(s, "1 scoop whey", today=dt.date(2026, 10, 20))
+    msg = bot.do_resetday(SessionLocal, dt.date(2026, 10, 23))
+    assert msg.startswith("🗑 Deleted 1 workout(s) and 1 meal(s) from 2026-10-23")
+    with SessionLocal() as s:
+        assert [h.date for h in storage.get_history(s, "bench press")] == ["2026-10-20"]
+        assert [m.text for m in storage.all_meals(s)] == ["1 scoop whey"]
+        assert storage.get_exercise(s, "bench press") is not None       # exercise and settings stay
+    # the day can be logged again afterwards
+    with SessionLocal.begin() as s:
+        assert tools.log_workout(s, "bench press 62.5x8,7,7 2026-10-23", today=TODAY)["status"] == "ok"
+
+
+def test_reset_everything(SessionLocal: sessionmaker[Session]) -> None:
+    with SessionLocal.begin() as s:
+        tools.log_meal(s, "2 eggs", today=TODAY)
+        tools.set_goal(s, "bench 100 kg")
+        tools.set_day_plan(s, "mon", ["bench press"])
+    text, has_data = bot.reset_preview(SessionLocal)
+    assert has_data and "1 exercises, workouts on 2 days, 1 meals" in text and "/export" in text
+    assert bot.do_reset(SessionLocal).startswith("🗑 Everything was deleted.")
+    with SessionLocal() as s:
+        assert storage.list_exercises(s) == [] and storage.all_meals(s) == []
+        assert storage.session_dates(s) == set() and storage.get_setting(s, "goal") is None
+        assert storage.get_day_plan(s) == {}
+    assert bot.reset_preview(SessionLocal) == ("There's nothing to reset - your data is already empty.", False)
+
+
+def test_reset_commands_and_buttons_are_wired(SessionLocal: sessionmaker[Session]) -> None:
+    from telegram.ext import CallbackQueryHandler
+    app = bot.build_application("123456:TEST-token-not-real", 42, SessionLocal, coach=None,
+                                settings=scheduler.ReminderSettings.from_env({}))
+    handlers = app.handlers[0]
+    commands = {c for h in handlers if isinstance(h, CommandHandler) for c in h.commands}
+    assert {"resetday", "reset"} <= commands
+    assert sum(isinstance(h, CallbackQueryHandler) for h in handlers) == 1

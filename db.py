@@ -28,6 +28,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    delete,
     event,
     func,
     make_url,
@@ -500,6 +501,31 @@ def record_notification(db: Session, date: dt.date, kind: str) -> None:
 
 def notifications_on(db: Session, date: dt.date) -> List[str]:
     return list(db.scalars(select(Notification.kind).where(Notification.date == date).order_by(Notification.id)))
+
+
+# ---------- reset (only from explicit, confirmed bot commands - never an agent tool) ----------
+
+def delete_day(db: Session, date: dt.date) -> Dict[str, int]:
+    """Delete every workout session (and its sets) and meal logged on one date."""
+    session_ids = list(db.scalars(select(WorkoutSession.id).where(WorkoutSession.date == date)))
+    if session_ids:
+        db.execute(delete(SetEntry).where(SetEntry.session_id.in_(session_ids)))
+        db.execute(delete(WorkoutSession).where(WorkoutSession.id.in_(session_ids)))
+    meals = db.execute(delete(Meal).where(Meal.date == date)).rowcount or 0
+    db.flush()
+    return {"sessions": len(session_ids), "meals": meals}
+
+
+def delete_everything(db: Session) -> Dict[str, int]:
+    """Fresh start: exercises, workouts, meals, plan, goal/settings and preferences.
+    Sent-message records are kept so today's reminders aren't sent twice."""
+    counts = {"exercises": db.scalar(select(func.count(Exercise.id))) or 0,
+              "sessions": db.scalar(select(func.count(WorkoutSession.id))) or 0,
+              "meals": db.scalar(select(func.count(Meal.id))) or 0}
+    for table in (SetEntry, WorkoutSession, DayPlan, Exercise, Meal, Preference, Setting):
+        db.execute(delete(table))
+    db.flush()
+    return counts
 
 # ---------- connection check (run: python db.py) ----------
 

@@ -241,3 +241,13 @@ def test_last_trace_records_tools_and_outputs(SessionLocal: sessionmaker[Session
     c.chat(1, "am I stuck on bench?")
     assert c.last_trace["tools"] == ["check_plateau"]
     assert '"plateau": false' in c.last_trace["tool_outputs"][0] and c.last_trace["retries"] == 0
+
+
+def test_forget_clears_one_chat_only(SessionLocal: sessionmaker[Session]) -> None:
+    c, llm = coach(SessionLocal, [AIMessage("a"), AIMessage("b"), AIMessage("c")])
+    c.chat("A", "hello")
+    c.chat("B", "hi")
+    c.forget("A")
+    c.chat("A", "again")
+    assert [m.content for m in llm.seen[2] if isinstance(m, HumanMessage)] == ["again"]
+    assert len(c.graph.get_state({"configurable": {"thread_id": "B"}}).values["messages"]) == 2

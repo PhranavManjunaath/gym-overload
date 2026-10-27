@@ -341,6 +341,10 @@ class Coach:
         self.graph = build_graph(llm, build_tools(SessionLocal, today), today, checkpointer, memory)
         self.last_trace: Dict[str, Any] = {}
 
+    def forget(self, chat_id: int | str) -> None:
+        """Drop this chat's conversation memory (after a reset, so old logs don't block re-logging)."""
+        self.graph.checkpointer.delete_thread(str(chat_id))
+
     def chat(self, chat_id: int | str, text: str) -> str:
         config = {"configurable": {"thread_id": str(chat_id)}, "recursion_limit": 25}
         before = len(self.graph.get_state(config).values.get("messages", []))

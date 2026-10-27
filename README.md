@@ -43,6 +43,7 @@ Based on: 2026-10-27: 60 kg × 10, 10, 10 (RPE 8, 8, 8)
 | Weekly report | "This week" card | Sunday 19:00 + `/report` | - |
 | Schedule | Settings (days, time, goal) | `/schedule`, `/plan`, `/goal` | - |
 | Export CSV | Settings → Your data | `/export` | Progress page |
+| Undo / fresh start | - | `/resetday` (one day), `/reset` (everything) - both ask first | - |
 | Reminders | Shown in Settings | ✅ sends them (max 2/day) | - |
 
 None of the front ends import each other; they share the database, tools, engine and

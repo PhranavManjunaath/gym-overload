@@ -21,8 +21,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session, sessionmaker
-from telegram import BotCommand, Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 import agent
 import db as storage
@@ -53,6 +54,8 @@ HELP_TEXT = (
     "  /goal <text> - your training goal\n"
     "  /report - this week's report\n"
     "  /export - your data as CSV\n"
+    "  /resetday [yesterday|2026-10-26] - delete one day's logs (asks first)\n"
+    "  /reset - delete everything and start fresh (asks first)\n"
     "  /exercises - your exercises and settings\n"
     "  /reminders - when I'll remind you (max 2 messages a day)\n"
     "  /help - this message"
@@ -68,6 +71,8 @@ COMMANDS = [
     BotCommand("schedule", "Training days and reminder time"),
     BotCommand("plan", "Exercises for a weekday"),
     BotCommand("export", "Download your data (CSV)"),
+    BotCommand("resetday", "Delete a day's logs (asks first)"),
+    BotCommand("reset", "Delete everything (asks first)"),
     BotCommand("exercises", "Your exercises"),
     BotCommand("reminders", "Reminder schedule"),
     BotCommand("help", "How to use the coach"),
@@ -224,6 +229,63 @@ def reply_report(SessionLocal: sessionmaker[Session], summarize: Optional[report
         return reports.weekly_report(s, today or dt.date.today(), summarize)
 
 
+def parse_day(args: Sequence[str], today: dt.date) -> Optional[dt.date]:
+    """No argument = today; also 'yesterday' or 2026-10-26. Future dates are refused."""
+    if not args:
+        return today
+    word = args[0].strip().lower()
+    if word == "today":
+        return today
+    if word == "yesterday":
+        return today - dt.timedelta(days=1)
+    try:
+        d = dt.date.fromisoformat(word)
+    except ValueError:
+        return None
+    return d if d <= today else None
+
+
+def resetday_preview(SessionLocal: sessionmaker[Session], args: Sequence[str],
+                     today: Optional[dt.date] = None) -> tuple:
+    """(message, day to delete or None). Lists exactly what would be deleted."""
+    day = parse_day(args, today or dt.date.today())
+    if day is None:
+        return "Usage: /resetday, /resetday yesterday or /resetday 2026-10-26", None
+    with SessionLocal() as s:
+        r = tools.day_summary(s, day)
+    if not r["workouts"] and not r["meals"]:
+        return f"Nothing is logged on {day.isoformat()}.", None
+    lines = [f"Delete everything logged on {day.isoformat()}?"]
+    lines += [f"  • {w['exercise']}: {formatting.format_sets(w['sets'])}" for w in r["workouts"]]
+    lines += [f"  • meal: {m['text']}" for m in r["meals"]]
+    lines.append("You can log it again afterwards.")
+    return "\n".join(lines), day
+
+
+def reset_preview(SessionLocal: sessionmaker[Session]) -> tuple:
+    """(message, True if there is anything to delete)."""
+    with SessionLocal() as s:
+        n_ex = len(storage.list_exercises(s))
+        n_days = len(storage.session_dates(s))
+        n_meals = len(storage.all_meals(s))
+    if not (n_ex or n_days or n_meals):
+        return "There's nothing to reset - your data is already empty.", False
+    return (f"⚠️ Delete EVERYTHING? {n_ex} exercises, workouts on {n_days} days, {n_meals} meals, "
+            f"plus your goal, schedule, plan and preferences.\nThis can't be undone - "
+            f"use /export first if you want a copy."), True
+
+
+def do_resetday(SessionLocal: sessionmaker[Session], day: dt.date) -> str:
+    r = _run(SessionLocal, tools.reset_day, day=day)
+    d = r["deleted"]
+    return f"🗑 Deleted {d['sessions']} workout(s) and {d['meals']} meal(s) from {r['date']}. Log it again whenever you're ready."
+
+
+def do_reset(SessionLocal: sessionmaker[Session]) -> str:
+    _run(SessionLocal, tools.reset_all)
+    return "🗑 Everything was deleted. Fresh start: add an exercise, e.g. 'add bench press, barbell'."
+
+
 def export_files(SessionLocal: sessionmaker[Session]) -> List[tuple]:
     with SessionLocal() as s:
         return [("workouts.csv", reports.export_workouts_csv(s)), ("meals.csv", reports.export_meals_csv(s))]
@@ -263,6 +325,37 @@ def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Sessi
         for name, content in await asyncio.to_thread(export_files, SessionLocal):
             await update.effective_message.reply_document(document=io.BytesIO(content.encode("utf-8")), filename=name)
 
+    def buttons(yes_label: str, yes_data: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(yes_label, callback_data=yes_data),
+                                      InlineKeyboardButton("Cancel", callback_data="cancel")]])
+
+    async def on_resetday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text, day = await asyncio.to_thread(resetday_preview, SessionLocal, context.args or [])
+        markup = buttons("Yes, delete", f"resetday:{day.isoformat()}") if day else None
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+    async def on_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text, has_data = await asyncio.to_thread(reset_preview, SessionLocal)
+        markup = buttons("Yes, delete everything", "resetall") if has_data else None
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+    async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if update.effective_chat is None or update.effective_chat.id != chat_id:
+            return                                            # only you can confirm a delete
+        await query.answer()
+        data = query.data or ""
+        if data.startswith("resetday:"):
+            result = await asyncio.to_thread(do_resetday, SessionLocal, dt.date.fromisoformat(data.split(":", 1)[1]))
+        elif data == "resetall":
+            result = await asyncio.to_thread(do_reset, SessionLocal)
+        else:
+            await query.edit_message_text("Cancelled - nothing was deleted.")
+            return
+        if coach is not None:
+            coach.forget(chat_id)                             # so old logs don't block re-logging
+        await query.edit_message_text(result)
+
     def reminders_text() -> str:
         sched = _run(SessionLocal, tools.get_schedule)
         return scheduler.describe(settings, sched["training_days"], sched["workout_time"])
@@ -301,6 +394,9 @@ def build_application(token: str, chat_id: int, SessionLocal: sessionmaker[Sessi
     app.add_handler(CommandHandler("goal", command(lambda a: reply_goal(SessionLocal, a)), filters=me))
     app.add_handler(CommandHandler("report", command(lambda a: reply_report(SessionLocal, summarize)), filters=me))
     app.add_handler(CommandHandler("export", on_export, filters=me))
+    app.add_handler(CommandHandler("resetday", on_resetday, filters=me))
+    app.add_handler(CommandHandler("reset", on_reset, filters=me))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~me, on_stranger))
     app.add_error_handler(on_error)

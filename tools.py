@@ -414,3 +414,25 @@ def set_protein_target(session: Session, grams: float) -> Result:
         return {"status": "error", "message": "Protein target must be between 1 and 500 g."}
     storage.set_setting(session, "protein_target_g", f"{grams:g}")
     return {"status": "ok", "target_g": float(grams)}
+
+
+# ---------- reset (bot commands only, after the user confirms - not agent tools) ----------
+
+def day_summary(session: Session, day: dt.date) -> Result:
+    """What is logged on a day - shown before /resetday asks for confirmation."""
+    workouts = []
+    for ex in storage.list_exercises(session):
+        for s in storage.get_history(session, ex.name):
+            if s.date == day.isoformat():
+                workouts.append({"exercise": ex.name, **_session(s)})
+    meals = [_meal(m) for m in storage.meals_between(session, day, day)]
+    return {"status": "ok", "date": day.isoformat(), "workouts": workouts, "meals": meals}
+
+
+def reset_day(session: Session, day: dt.date) -> Result:
+    counts = storage.delete_day(session, day)
+    return {"status": "ok", "date": day.isoformat(), "deleted": counts}
+
+
+def reset_all(session: Session) -> Result:
+    return {"status": "ok", "deleted": storage.delete_everything(session)}
