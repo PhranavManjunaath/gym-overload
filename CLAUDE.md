@@ -45,6 +45,9 @@ plus workout/diet reminders for consistency. Portfolio project.
 - Small modules: `db.py`, `parser.py`, `tools.py`, `agent.py`, `bot.py`,
   `scheduler.py`, `dashboard.py`, plus `formatting.py` (deterministic text for
   tool results). Type hints everywhere. Tests in `tests/`.
+- The app (`streamlit run dashboard.py`, pages in `web/`) is separate from the
+  Telegram bot: it must never import `bot.py`. Both share db/tools/engine/agent.
+  App pages only display results from `tools.py` — no math in the UI.
 - The agent's `verify` node rejects any reply containing a number not found in a
   tool result or user message; keep it. Agent tests use a scripted fake LLM —
   never call Groq from pytest.

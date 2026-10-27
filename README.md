@@ -29,16 +29,30 @@ Rule: increase_weight - All working sets reached 10 reps (RPE <= 9 where logged)
 Based on: 2026-10-27: 60 kg × 10, 10, 10 (RPE 8, 8, 8)
 ```
 
+## Two ways to use it (separate, same data)
+
+| | Telegram bot (`bot.py`) | App (`dashboard.py`) |
+|---|---|---|
+| Log workouts | send `bench 60x10,10,9` | Log page with a preview before saving |
+| Next targets | `/next bench` or ask | Next session page, with a "Why?" box for every lift |
+| Progress | `/progress bench` | Charts: weight, e1RM, volume + history |
+| Exercises | "add squat, barbell" | Exercises page with a form |
+| AI coach | every text message | AI coach page (its own conversation) |
+| Reminders | ✅ (APScheduler) | - |
+
+The app never imports the bot; they run as separate processes and share the database,
+tools, engine and agent, so the numbers always match.
+
 ## Architecture
 
 ```
+dashboard.py + web/ (Streamlit app) ─▶ tools.py / agent.py   (same core, no bot)
 Telegram ─▶ bot.py ─▶ agent.py (LangGraph: agent ⇄ tools ─▶ verify) ─▶ Groq LLM
                 │            │
                 │            └─▶ tools.py ─▶ progression_engine.py (all math)
                 │                     └────▶ db.py ─▶ Supabase Postgres (or SQLite)
                 ├─▶ /next /progress: tools.py directly (no LLM)
                 └─▶ scheduler.py (APScheduler): workout, missed-workout and meal reminders
-dashboard.py (Streamlit) ─▶ tools.py ─▶ charts of weight, e1RM, volume
 parser.py: "bench 60x10,10,9 @8" ─▶ exact sets (regex, no LLM)
 formatting.py: tool results ─▶ plain text (no LLM)
 ```
@@ -75,8 +89,11 @@ pytest                      # no API keys needed - the LLM is faked in tests
 
 ```bash
 python bot.py                 # Telegram bot + reminders
-streamlit run dashboard.py    # progress dashboard in the browser
+streamlit run dashboard.py    # the app → http://localhost:8501
 ```
+
+The app only listens on this computer (`.streamlit/config.toml`). Set `WEB_PASSWORD` in `.env`
+to require a password.
 
 ## Telegram usage
 
@@ -88,4 +105,6 @@ streamlit run dashboard.py    # progress dashboard in the browser
 
 Every module has tests in `tests/`: engine rules, parser formats and bad input, DB storage,
 tools (every rule returns its evidence), the agent graph (scripted fake LLM, including the
-made-up-number rewrite and fallback), reminders, bot replies and chat lock, and the dashboard.
+made-up-number rewrite and fallback), reminders, bot replies and chat lock, and every app page
+(Streamlit `AppTest`: preview-before-save, never guessing a starting weight, password gate, and a
+check that the app never imports the bot).

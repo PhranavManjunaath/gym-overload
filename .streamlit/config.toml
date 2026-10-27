@@ -1,0 +1,7 @@
+[server]
+# Only this computer can open the app (not other devices on your Wi-Fi).
+address = "localhost"
+port = 8501
+
+[browser]
+gatherUsageStats = false
