@@ -125,8 +125,23 @@ def test_website_api_still_served(env: None, SessionLocal: sessionmaker[Session]
 
 def test_secrets_are_required(env: None, SessionLocal: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CRON_SECRET", "")
-    with pytest.raises(RuntimeError, match="CRON_SECRET"):
+    with pytest.raises(RuntimeError, match="CRON_SECRET is missing"):
         make(SessionLocal)
+
+
+def test_startup_lists_every_missing_setting_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    for n in server.REQUIRED:
+        monkeypatch.delenv(n, raising=False)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "my-chat")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "has spaces+slash/")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_secret_value_that_must_not_be_printed")
+    with pytest.raises(RuntimeError) as e:
+        server.check_environment(full=True)
+    msg = str(e.value)
+    for n in ["TELEGRAM_BOT_TOKEN", "DATABASE_URL", "CRON_SECRET", "WEB_PASSWORD"]:
+        assert f"{n} is missing" in msg
+    assert "TELEGRAM_CHAT_ID must be a number" in msg and "only contain letters" in msg
+    assert "gsk_secret_value" not in msg and "has spaces" not in msg          # names only, never values
 
 
 def test_render_url_is_used_when_public_url_missing(env: None, SessionLocal: sessionmaker[Session],

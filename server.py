@@ -25,6 +25,7 @@ import datetime as dt
 import hmac
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -42,6 +43,24 @@ import scheduler
 log = logging.getLogger("gym_server")
 
 
+REQUIRED = ["GROQ_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "DATABASE_URL",
+            "TELEGRAM_WEBHOOK_SECRET", "CRON_SECRET", "WEB_PASSWORD"]
+
+
+def check_environment(full: bool = True) -> None:
+    """Fail at startup with ONE clear line naming every missing/invalid setting (names only, never values)."""
+    names = REQUIRED if full else ["TELEGRAM_CHAT_ID", "TELEGRAM_WEBHOOK_SECRET", "CRON_SECRET"]
+    problems = [f"{n} is missing" for n in names if not os.getenv(n, "").strip()]
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if chat_id and not chat_id.lstrip("-").isdigit():
+        problems.append("TELEGRAM_CHAT_ID must be a number")
+    secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    if secret and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+        problems.append("TELEGRAM_WEBHOOK_SECRET may only contain letters, digits, _ and -")
+    if problems:
+        raise RuntimeError("Fix these environment variables (Render -> Environment): " + "; ".join(problems))
+
+
 def _same(given: Optional[str], expected: str) -> bool:
     return bool(expected) and hmac.compare_digest((given or "").encode(), expected.encode())
 
@@ -57,14 +76,13 @@ def create_server(
         logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)      # Telegram URLs contain the bot token
     storage.database_url()                                    # loads .env when running locally
+    check_environment(full=application is None)
     chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
-    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-    cron_secret = os.getenv("CRON_SECRET", "")
+    webhook_secret = os.environ["TELEGRAM_WEBHOOK_SECRET"]
+    cron_secret = os.environ["CRON_SECRET"]
     public_url = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
     settings = settings or scheduler.ReminderSettings.from_env()
     now = now or (lambda: dt.datetime.now(ZoneInfo(settings.timezone)))
-    if not webhook_secret or not cron_secret:
-        raise RuntimeError("Set TELEGRAM_WEBHOOK_SECRET and CRON_SECRET")
 
     if SessionLocal is None:
         engine = storage.get_engine()
